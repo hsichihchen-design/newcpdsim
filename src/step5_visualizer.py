@@ -20,7 +20,7 @@ def load_map_robust(filename):
     return []
 
 def main():
-    print("🚀 [Step 5] 啟動視覺化 (Safe Injection Mode)...")
+    print("🚀 [Step 5] 啟動視覺化 (Fix Disappearing Cars & Layout)...")
 
     # 1. Map
     map_2f = load_map_robust('2F_map.xlsx')
@@ -28,19 +28,23 @@ def main():
     
     # 2. Events
     events_path = os.path.join(LOG_DIR, 'simulation_events.csv')
-    if not os.path.exists(events_path): 
-        print("❌ 找不到 simulation_events.csv")
-        return
-        
+    if not os.path.exists(events_path): return
     df_events = pd.read_csv(events_path)
     df_events['start_ts'] = pd.to_datetime(df_events['start_time'], format='mixed').astype('int64') // 10**9
     df_events['end_ts'] = pd.to_datetime(df_events['end_time'], format='mixed').astype('int64') // 10**9
+    
+    # Filter valid
     df_events = df_events[(df_events['sx']>=0) & (df_events['sy']>=0)]
     
-    min_time = df_events['start_ts'].min()
-    max_time = df_events['end_ts'].max()
-    all_agvs = df_events[df_events['type'] == 'AGV_MOVE']['obj_id'].unique().tolist()
+    # Sort events by time to ensure correct playback state reconstruction
+    df_events = df_events.sort_values('start_ts')
+    
     events_data = df_events[['start_ts', 'end_ts', 'floor', 'obj_id', 'sx', 'sy', 'ex', 'ey', 'type', 'text']].fillna('').values.tolist()
+    min_time = df_events['start_ts'].min() if not df_events.empty else 0
+    max_time = df_events['end_ts'].max() if not df_events.empty else 1
+    
+    # Get all unique AGVs for initialization
+    all_agvs = df_events[df_events['type']=='AGV_MOVE']['obj_id'].unique().tolist()
 
     # 3. KPI
     kpi_path = os.path.join(LOG_DIR, 'simulation_kpi.csv')
@@ -50,7 +54,6 @@ def main():
         df_kpi['date'] = pd.to_datetime(df_kpi['finish_time'], format='mixed').dt.date.astype(str)
         kpi_raw = df_kpi[['finish_ts', 'type', 'wave_id', 'is_delayed', 'date', 'workstation']].values.tolist()
         
-        # Stats
         wave_stats = {}
         for _, row in df_kpi[df_kpi['type']=='PICKING'].iterrows():
             wid = row['wave_id']
@@ -59,13 +62,12 @@ def main():
             if row['is_delayed'] == 'Y': wave_stats[wid]['delayed'] += 1
             
         recv_totals = df_kpi[df_kpi['type'] == 'RECEIVING'].groupby('date').size().to_dict()
-    except Exception as e:
-        print(f"⚠️ KPI Error: {e}")
+    except:
         kpi_raw = []
         wave_stats = {}
         recv_totals = {}
 
-    # --- HTML Template (No f-string here to avoid brace conflicts) ---
+    # --- Injection Template ---
     html_template = """
 <!DOCTYPE html>
 <html>
@@ -74,57 +76,77 @@ def main():
     <title>Warehouse Monitor</title>
     <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
     <style>
-        body { font-family: 'Segoe UI', Roboto, sans-serif; background: #eef1f5; margin: 0; display: flex; flex-direction: column; height: 100vh; overflow: hidden; }
+        body { font-family: 'Segoe UI', sans-serif; margin: 0; display: flex; flex-direction: column; height: 100vh; overflow: hidden; background: #eef1f5; }
         .header { background: #fff; height: 40px; padding: 0 20px; display: flex; align-items: center; border-bottom: 1px solid #ddd; flex-shrink: 0; }
         .main { display: flex; flex: 1; overflow: hidden; }
-        .map-section { flex: 3; display: flex; flex-direction: column; padding: 10px; gap: 10px; }
-        .floor-container { flex: 1; background: #fff; border: 1px solid #ccc; border-radius: 4px; padding: 5px; position: relative; display: flex; flex-direction: column; min-height: 0; }
-        .floor-label { position: absolute; top: 5px; left: 5px; background: rgba(255,255,255,0.8); padding: 2px 6px; font-weight: bold; border: 1px solid #999; z-index: 5; font-size: 12px; }
-        .canvas-wrap { flex: 1; position: relative; width: 100%; height: 100%; }
+        
+        /* Map Section: Use Flexbox to ensure both floors fit */
+        .map-section { flex: 3; display: flex; flex-direction: column; padding: 10px; gap: 10px; overflow: hidden; }
+        .floor-container { 
+            flex: 1; /* Both floors take equal space */
+            background: #fff; border: 1px solid #ccc; border-radius: 4px; padding: 5px; 
+            position: relative; display: flex; flex-direction: column; 
+            min-height: 0; /* Critical for nested flex scrolling/sizing */
+        }
+        .floor-label { position: absolute; top: 5px; left: 5px; background: rgba(255,255,255,0.8); padding: 2px 6px; font-weight: bold; font-size: 12px; z-index: 10; border: 1px solid #999; }
+        .canvas-wrap { flex: 1; width: 100%; height: 100%; position: relative; }
         canvas { display: block; width: 100%; height: 100%; }
-        .dash-section { flex: 1; min-width: 320px; max-width: 380px; background: #fff; border-left: 1px solid #ccc; display: flex; flex-direction: column; }
+        
+        /* Dashboard */
+        .dash-section { flex: 1; min-width: 320px; max-width: 400px; background: #fff; border-left: 1px solid #ccc; display: flex; flex-direction: column; }
         .dash-content { flex: 1; overflow-y: auto; padding: 10px; }
         .panel { margin-bottom: 10px; border: 1px solid #eee; padding: 8px; border-radius: 4px; background: #fafafa; }
         .panel h4 { margin: 0 0 5px 0; border-bottom: 2px solid #007bff; font-size: 14px; color: #333; }
         .wave-item { margin-bottom: 4px; padding: 4px; background: #fff; border: 1px solid #ddd; font-size: 11px; }
         .wave-item.active { border-color: #007bff; border-left-width: 3px; }
-        .wave-item.delayed { border-left: 4px solid #dc3545; }
         .progress { height: 5px; background: #e9ecef; margin-top: 2px; }
         .progress-bar { height: 100%; transition: width 0.3s; }
+        
         .controls { padding: 10px; background: #fff; border-top: 1px solid #ddd; display: flex; gap: 10px; align-items: center; flex-shrink: 0; }
         button { cursor: pointer; background: #007bff; color: white; border: none; padding: 5px 15px; border-radius: 4px; }
         input[type=range] { flex: 1; }
-        .ws-grid { display: grid; grid-template-columns: repeat(4, 1fr); gap: 4px; }
-        .ws-box { background: #fff; border: 1px solid #ccc; padding: 2px; text-align: center; border-radius: 2px; font-size: 10px; }
-        .ws-box.busy { background: #ffebeb; border-color: red; color: red; font-weight: bold; }
+        .stat-row { display: flex; justify-content: space-between; font-size: 13px; margin-bottom: 3px; }
+        .stat-val { font-weight: bold; color: #007bff; }
     </style>
 </head>
 <body>
     <div class="header">
-        <h3>🏭 倉儲模擬 (Safe Mode)</h3>
+        <h3>🏭 倉儲模擬 (Fix: Clipping & State)</h3>
         <div style="flex:1"></div>
         <span id="timeDisplay" style="font-weight: bold;">--</span>
     </div>
     <div class="main">
         <div class="map-section">
-            <div class="floor-container"><div class="floor-label">2F</div><div class="canvas-wrap"><canvas id="c2"></canvas></div></div>
-            <div class="floor-container"><div class="floor-label">3F</div><div class="canvas-wrap"><canvas id="c3"></canvas></div></div>
+            <div class="floor-container">
+                <div class="floor-label">2F</div>
+                <div class="canvas-wrap"><canvas id="c2"></canvas></div>
+            </div>
+            <div class="floor-container">
+                <div class="floor-label">3F</div>
+                <div class="canvas-wrap"><canvas id="c3"></canvas></div>
+            </div>
         </div>
         <div class="dash-section">
             <div class="dash-content">
-                <div class="panel"><h4>🌊 波次進度</h4><div id="wave-list">Loading...</div></div>
                 <div class="panel">
-                    <h4>🚛 進貨狀況</h4>
-                    <div>目標/完成: <span id="recv-txt">0/0</span></div>
+                    <h4>🌊 波次進度</h4>
+                    <div id="wave-list">Loading...</div>
+                </div>
+                <div class="panel">
+                    <h4>🚛 進貨</h4>
+                    <div class="stat-row"><span>完成/目標</span> <span id="recv-txt">0 / 0</span></div>
                     <div class="progress"><div id="recv-bar" class="progress-bar" style="background:#17a2b8; width:0%"></div></div>
                 </div>
-                <div class="panel"><h4>📊 統計</h4><div>活躍 AGV: <span id="val-active">0</span></div></div>
-                <div class="panel"><h4>🏭 工作站</h4><div style="margin-bottom:5px">2F</div><div id="ws-2f" class="ws-grid"></div><div style="margin-top:5px;margin-bottom:5px">3F</div><div id="ws-3f" class="ws-grid"></div></div>
+                <div class="panel">
+                    <h4>📊 統計</h4>
+                    <div class="stat-row"><span>活躍 AGV</span> <span id="val-active">0</span></div>
+                    <div class="stat-row"><span>已完成單</span> <span id="val-done">0</span></div>
+                </div>
             </div>
             <div class="controls">
                 <button onclick="togglePlay()" id="playBtn">Play</button>
                 <input type="range" id="slider" min="__MIN_TIME__" max="__MAX_TIME__" value="__MIN_TIME__">
-                <select id="speed"><option value="1">1x</option><option value="10" selected>10x</option><option value="60">60x</option></select>
+                <select id="speed"><option value="10">10x</option><option value="60">1 min/s</option><option value="600" selected>10 min/s</option></select>
             </div>
         </div>
     </div>
@@ -137,8 +159,9 @@ def main():
     const recvTotals = __RECV_TOTALS__;
     const agvIds = __AGV_IDS__;
 
+    // State Memory
     let agvState = {};
-    agvIds.forEach(id => { agvState[id] = { floor: '2F', x: 0, y: 0, visible: false }; });
+    agvIds.forEach(id => { agvState[id] = { floor: '2F', x: -1, y: -1, visible: false }; });
 
     function setupCanvas(id, mapData) {
         const c = document.getElementById(id);
@@ -147,9 +170,12 @@ def main():
         const w = parent.clientWidth;
         const h = parent.clientHeight;
         c.width = w; c.height = h;
+        
         const rows = mapData.length || 10;
         const cols = mapData[0]?.length || 10;
-        const size = Math.min(w/cols, h/rows);
+        const scaleX = w / cols;
+        const scaleY = h / rows;
+        const size = Math.min(scaleX, scaleY);
         const ox = (w - cols*size)/2;
         const oy = (h - rows*size)/2;
         return { ctx, rows, cols, size, ox, oy, map: mapData };
@@ -159,25 +185,13 @@ def main():
     let f3 = setupCanvas('c3', map3F);
     window.onresize = () => { f2 = setupCanvas('c2', map2F); f3 = setupCanvas('c3', map3F); render(); };
 
-    function initWS() {
-        const w2 = document.getElementById('ws-2f');
-        const w3 = document.getElementById('ws-3f');
-        let h2='', h3='';
-        for(let i=1; i<=8; i++) h2 += `<div id="ws-box-${i}" class="ws-box">WS_${i}</div>`;
-        for(let i=101; i<=108; i++) h3 += `<div id="ws-box-${i}" class="ws-box">WS_${i}</div>`;
-        w2.innerHTML = h2; w3.innerHTML = h3;
-    }
-    initWS();
-
     function drawMap(obj) {
         const ctx = obj.ctx;
         ctx.fillStyle = '#fafafa'; ctx.fillRect(0,0, ctx.canvas.width, ctx.canvas.height);
         for(let r=0; r<obj.rows; r++) {
             for(let c=0; c<obj.cols; c++) {
                 const val = obj.map[r][c];
-                const x = obj.ox + c*obj.size;
-                const y = obj.oy + r*obj.size;
-                const s = obj.size;
+                const x=obj.ox+c*obj.size, y=obj.oy+r*obj.size, s=obj.size;
                 if(val==1) { ctx.fillStyle='#ccc'; ctx.fillRect(x,y,s,s); }
                 else if(val==2) { ctx.strokeStyle='#666'; ctx.strokeRect(x,y,s,s); }
                 else if(val==3) { ctx.fillStyle='#cff4fc'; ctx.fillRect(x,y,s,s); }
@@ -188,21 +202,59 @@ def main():
     let currTime = __MIN_TIME__;
     let isPlaying = false;
 
+    // Helper: Find last known position if current event is missing
+    // This solves "Disappearing Car" when using slider or sparse events
+    function updateAGVStateStrict(time) {
+        // Reset visible to false first? No, assume persistence.
+        // We only update if we find a relevant event <= time
+        
+        // This is O(N*M) worst case, but manageable for 16 AGVs
+        agvIds.forEach(id => {
+            // Find the *latest* event for this AGV that started before 'time'
+            // Since events are sorted by start_time, we can search backwards or filter
+            // Optimization: Just filter valid events for this ID
+            // Simple approach: Filter all events for this ID <= time, take last.
+            
+            // For performance in browser, we can rely on forward-play caching.
+            // But for slider jumps, we need a full scan.
+            // Let's do a simple full scan for now (safe).
+            
+            let lastEvt = null;
+            // Iterate backwards is faster for "latest"
+            for(let i=events.length-1; i>=0; i--) {
+                const e = events[i];
+                if(e[0] <= time && e[3] === id && e[8] === 'AGV_MOVE') {
+                    lastEvt = e;
+                    break;
+                }
+            }
+            
+            if(lastEvt) {
+                // If the event spans across 'time' (it's happening now) -> Interpolate
+                if (time <= lastEvt[1]) {
+                    const totalDur = lastEvt[1] - lastEvt[0];
+                    const p = (time - lastEvt[0]) / totalDur;
+                    const sx=lastEvt[4], sy=lastEvt[5], ex=lastEvt[6], ey=lastEvt[7];
+                    const cx = sx + (ex-sx)*p;
+                    const cy = sy + (ey-sy)*p;
+                    agvState[id] = { floor: lastEvt[2], x: cx, y: cy, visible: true };
+                } else {
+                    // Event finished in the past -> Car stays at 'ex, ey'
+                    const ex=lastEvt[6], ey=lastEvt[7];
+                    agvState[id] = { floor: lastEvt[2], x: ex, y: ey, visible: true };
+                }
+            }
+        });
+    }
+
     function render() {
         drawMap(f2); drawMap(f3);
-        const activeEvts = events.filter(e => currTime >= e[0] && currTime <= e[1] && e[8] == 'AGV_MOVE');
         
-        activeEvts.forEach(e => {
-            const totalDur = e[1] - e[0];
-            const p = (currTime - e[0]) / totalDur;
-            const sx=e[4], sy=e[5], ex=e[6], ey=e[7];
-            const cx = sx + (ex-sx)*p;
-            const cy = sy + (ey-sy)*p;
-            agvState[e[3]] = { floor: e[2], x: cx, y: cy, visible: true };
-        });
+        // Update State (Strict Mode)
+        updateAGVStateStrict(currTime);
         
         let activeCount = 0;
-        const occupancy = {};
+        const occ = {};
         
         Object.keys(agvState).forEach(id => {
             const s = agvState[id];
@@ -211,14 +263,11 @@ def main():
             const ctx = obj.ctx;
             const sz = obj.size;
             
+            // Jitter
             const key = s.floor + '_' + Math.round(s.x) + '_' + Math.round(s.y);
-            const occ = occupancy[key] || 0;
-            occupancy[key] = occ + 1;
-            let ox = 0, oy = 0;
-            if(occ > 0) {
-                ox = (occ%2==0?1:-1) * (occ*2);
-                oy = (occ%3==0?1:-1) * (occ*2);
-            }
+            occ[key] = (occ[key]||0) + 1;
+            let ox=0, oy=0;
+            if(occ[key]>1) { ox=(occ[key]*2); oy=(occ[key]*2); }
             
             const px = obj.ox + s.x * sz + sz/2 + ox;
             const py = obj.oy + s.y * sz + sz/2 + oy;
@@ -228,10 +277,12 @@ def main():
             activeCount++;
         });
 
-        // Update KPI
+        // KPI
         const doneTasks = kpiRaw.filter(k => k[0] <= currTime);
         document.getElementById('val-active').innerText = activeCount;
+        document.getElementById('val-done').innerText = doneTasks.length;
         
+        // Waves
         const doneByWave = {};
         doneTasks.filter(k=>k[1]=='PICKING').forEach(k=>{ doneByWave[k[2]]=(doneByWave[k[2]]||0)+1 });
         
@@ -249,10 +300,9 @@ def main():
                 </div>`;
             }
         });
-        if(!html) html = '<div style="color:#999;text-align:center">Waiting...</div>';
-        document.getElementById('wave-list').innerHTML = html;
+        document.getElementById('wave-list').innerHTML = html || '<div style="color:#999;text-align:center">Waiting...</div>';
         
-        // Receiving
+        // Recv
         const nowStr = new Date(currTime*1000).toISOString().split('T')[0];
         const target = recvTotals[nowStr] || 0;
         const rDone = doneTasks.filter(k => k[4]==nowStr && k[1]=='RECEIVING').length;
@@ -281,9 +331,7 @@ def main():
 </body>
 </html>
 """
-    
-    # --- Safe Injection ---
-    # 使用 replace 替換佔位符，完全避免 f-string 衝突
+    # Safe Injection
     final_html = html_template.replace('__MAP2F__', json.dumps(map_2f)) \
                               .replace('__MAP3F__', json.dumps(map_3f)) \
                               .replace('__EVENTS__', json.dumps(events_data)) \

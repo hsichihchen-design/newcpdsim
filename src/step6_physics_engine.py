@@ -10,17 +10,31 @@ LOG_DIR = os.path.join(BASE_DIR, 'logs')
 DATA_MAP_DIR = os.path.join(BASE_DIR, 'data', 'master')
 DATA_TRX_DIR = os.path.join(BASE_DIR, 'data', 'transaction')
 
-# A* Logic
+# ==========================================
+# A* Pathfinding
+# ==========================================
 def heuristic(a, b): return abs(a[0] - b[0]) + abs(a[1] - b[1])
 
 def find_path(grid, start, goal):
     rows, cols = grid.shape
+    # 邊界檢查
+    if not (0 <= start[0] < rows and 0 <= start[1] < cols): return None
+    if not (0 <= goal[0] < rows and 0 <= goal[1] < cols): return None
+    
     open_set = []
     heapq.heappush(open_set, (0, start))
     came_from = {}
     g_score = {start: 0}
     f_score = {start: heuristic(start, goal)}
+    
+    # 限制搜索步數，避免死路卡太久
+    steps = 0
+    max_steps = 5000 
+
     while open_set:
+        steps += 1
+        if steps > max_steps: return None 
+
         current = heapq.heappop(open_set)[1]
         if current == goal:
             path = []
@@ -29,26 +43,34 @@ def find_path(grid, start, goal):
                 current = came_from[current]
             path.reverse()
             return path
+
         for dr, dc in [(0, 1), (0, -1), (1, 0), (-1, 0)]:
             neighbor = (current[0] + dr, current[1] + dc)
             if 0 <= neighbor[0] < rows and 0 <= neighbor[1] < cols:
                 if grid[neighbor[0]][neighbor[1]] == 1 and neighbor != goal: continue
-                t_g = g_score[current] + 1
-                if neighbor not in g_score or t_g < g_score[neighbor]:
+                
+                tentative_g = g_score[current] + 1
+                if neighbor not in g_score or tentative_g < g_score[neighbor]:
                     came_from[neighbor] = current
-                    g_score[neighbor] = t_g
-                    f_score[neighbor] = t_g + heuristic(neighbor, goal)
+                    g_score[neighbor] = tentative_g
+                    f_score[neighbor] = tentative_g + heuristic(neighbor, goal)
                     heapq.heappush(open_set, (f_score[neighbor], neighbor))
     return None
 
+# ==========================================
+# Simulation Classes
+# ==========================================
 class TrafficManager:
     def __init__(self): self.occupied = {}
     def request(self, agv_id, floor, pos):
         key = (floor, pos[0], pos[1])
-        return False if key in self.occupied and self.occupied[key] != agv_id else True
+        if key in self.occupied and self.occupied[key] != agv_id:
+            return False
+        return True
     def update(self, agv_id, floor, old, new):
         old_k = (floor, old[0], old[1])
-        if old_k in self.occupied and self.occupied[old_k] == agv_id: del self.occupied[old_k]
+        if old_k in self.occupied and self.occupied[old_k] == agv_id: 
+            del self.occupied[old_k]
         self.occupied[(floor, new[0], new[1])] = agv_id
 
 class AGV:
@@ -58,7 +80,7 @@ class AGV:
         self.pos = start_pos
         self.path = []
         self.state = 'IDLE' 
-        self.task_data = None # Store current order info
+        self.task_data = None 
 
     def assign_task(self, grid, target, order_data):
         path = find_path(grid, self.pos, target)
@@ -77,13 +99,12 @@ class AGV:
                 self.pos = next_pos
                 self.path.pop(0)
                 if not self.path:
-                    self.state = 'WORKING' # Arrived
+                    self.state = 'WORKING' 
                     return 'ARRIVED', self.pos
                 return 'MOVED', self.pos
             else:
                 return 'BLOCKED', self.pos
         elif self.state == 'WORKING':
-            # Simulate picking time (simple 1 tick)
             self.state = 'IDLE'
             done_task = self.task_data
             self.task_data = None
@@ -92,7 +113,7 @@ class AGV:
 
 class PhysicsSim:
     def __init__(self):
-        print("🚀 [Step 6] 物理模擬引擎啟動 (Strict KPI Writing)...")
+        print("🚀 [Step 6] 物理模擬引擎啟動 (Fix: Timestamp vs String)...")
         self.tm = TrafficManager()
         self.w2 = self._load_grid('2F_map.xlsx')
         self.w3 = self._load_grid('3F_map.xlsx')
@@ -106,7 +127,9 @@ class PhysicsSim:
         p = os.path.join(DATA_MAP_DIR, f)
         if not os.path.exists(p): p = p.replace('.xlsx', '.csv')
         try: return pd.read_excel(p, header=None).fillna(0).values
-        except: return pd.read_csv(p, header=None).fillna(0).values
+        except: 
+            try: return pd.read_csv(p, header=None).fillna(0).values
+            except: return np.zeros((30,60))
 
     def _load_shelf_map(self):
         p = os.path.join(BASE_DIR, 'data', 'mapping', 'shelf_coordinate_map.csv')
@@ -118,6 +141,7 @@ class PhysicsSim:
     def _spawn_agvs(self, grid, floor, start, count):
         rows, cols = grid.shape
         cands = [(r,c) for r in range(rows) for c in range(cols) if grid[r][c] in [0,3]]
+        if not cands: cands = [(0,0)]
         import random
         random.shuffle(cands)
         for i in range(count):
@@ -131,11 +155,21 @@ class PhysicsSim:
         try:
             try: df = pd.read_csv(p, encoding='utf-8-sig')
             except: df = pd.read_csv(p, encoding='cp950')
+            
+            # [修正] 確保 datetime 正確轉換
             df['datetime'] = pd.to_datetime(df['datetime'])
+            
+            # [修正] 關鍵點：同時將 WAVE_DEADLINE 轉為 datetime 物件
+            if 'WAVE_DEADLINE' in df.columns:
+                df['WAVE_DEADLINE'] = pd.to_datetime(df['WAVE_DEADLINE'], errors='coerce')
+                
             return df.sort_values('datetime').to_dict('records')
-        except: return []
+        except Exception as e: 
+            print(f"❌ 讀取訂單失敗: {e}")
+            return []
 
-    def run(self, max_ticks=86400):
+    def run(self, max_ticks=864000): # 修改預設值為 10 天
+        # Setup Logs
         f_evt = open(os.path.join(LOG_DIR, 'simulation_events.csv'), 'w', newline='', encoding='utf-8')
         w_evt = csv.writer(f_evt)
         w_evt.writerow(['start_time', 'end_time', 'floor', 'obj_id', 'sx', 'sy', 'ex', 'ey', 'type', 'text'])
@@ -144,55 +178,82 @@ class PhysicsSim:
         w_kpi = csv.writer(f_kpi)
         w_kpi.writerow(['finish_time', 'type', 'wave_id', 'is_delayed', 'date', 'workstation'])
 
-        if not self.orders: return
+        if not self.orders: 
+            print("⚠️ 無訂單資料")
+            return
+            
         sim_time = self.orders[0]['datetime']
         oidx = 0
+        completed_count = 0
         
-        print(f"🎬 開始模擬 {max_ticks} 秒...")
+        print(f"🎬 開始模擬 10 天 (目標 Ticks: {max_ticks})...")
+        print(f"   起始時間: {sim_time}")
         
         for tick in range(max_ticks):
             sim_time += timedelta(seconds=1)
             
-            # 1. Dispatch
+            # 1. Dispatch Orders
             while oidx < len(self.orders) and self.orders[oidx]['datetime'] <= sim_time:
                 ord_data = self.orders[oidx]
-                # Try real shelf or random
-                # 這裡簡化: 為了讓進度條跑，我們隨機選一個點
-                # (如果您的 shelf_map 是空的，這會保證有任務)
-                target_pos = (10, 10) 
+                
+                target_pos = None
                 target_floor = '2F'
                 
-                # Try to dispatch
+                if self.shelf_map:
+                    import random
+                    sid = random.choice(list(self.shelf_map.keys()))
+                    info = self.shelf_map[sid]
+                    target_pos = info['pos']
+                    target_floor = info['floor']
+                else:
+                    target_pos = (10, 10)
+                
                 candidates = [a for a in self.agvs if a.state=='IDLE' and a.floor==target_floor]
                 if candidates:
-                    candidates[0].assign_task(self.w2, target_pos, ord_data)
+                    candidates.sort(key=lambda a: abs(a.pos[0]-target_pos[0]) + abs(a.pos[1]-target_pos[1]))
+                    assigned = candidates[0].assign_task(self.w2 if target_floor=='2F' else self.w3, target_pos, ord_data)
+                    if assigned:
+                        oidx += 1 
+                    else:
+                        break 
+                else:
+                    break 
                 
-                oidx += 1
-
-            # 2. Move
+            # 2. Physics Step
             for agv in self.agvs:
                 status, res = agv.step(self.tm)
                 
                 if status == 'MOVED':
                     w_evt.writerow([
                         sim_time-timedelta(seconds=1), sim_time, agv.floor, f"AGV_{agv.id}",
-                        res[1], res[0], res[1], res[0], 'AGV_MOVE', '' # 這裡簡化: 起點=終點 (step 是一格)
-                        # 修正: 為了讓視覺化平滑，其實應該傳 old_pos -> new_pos
-                        # 但這裡我們先求 "有在動"。
+                        res[1], res[0], res[1], res[0], 'AGV_MOVE', '' 
                     ])
                 elif status == 'DONE':
-                    # Task Finished -> Write KPI
+                    completed_count += 1
                     task = res
+                    
+                    # [修正] 這裡比較 Timestamp vs Timestamp，不會再報錯了
+                    deadline = task.get('WAVE_DEADLINE')
+                    
+                    # 防呆: 如果沒有 deadline 或是 NaT，就給一個寬限期
+                    if pd.isna(deadline):
+                        deadline = sim_time + timedelta(hours=1)
+                        
+                    is_delayed = 'Y' if sim_time > deadline else 'N'
+                    
                     w_kpi.writerow([
-                        sim_time, 'PICKING', task.get('WAVE_ID', 'W_Unknown'), 
-                        'N', sim_time.date(), 'WS_1'
+                        sim_time, 'PICKING', task.get('WAVE_ID', 'W_DEFAULT'), 
+                        is_delayed, sim_time.date(), 'WS_1'
                     ])
 
-            if tick % 1000 == 0: print(f"\rTick: {tick}", end='')
+            if tick % 5000 == 0: 
+                pct = (tick / max_ticks) * 100
+                print(f"\r⏳ 進度: {pct:.1f}% | 時間: {sim_time} | 完成單量: {completed_count}", end='')
 
         f_evt.close()
         f_kpi.close()
-        print("\n✅ 完成")
+        print(f"\n✅ 模擬結束！共完成 {completed_count} 張訂單")
 
 if __name__ == "__main__":
-    PhysicsSim().run(max_ticks=864000) # 先跑 1 小時測試
+    # 執行模擬：10 天 = 86400 * 10 = 864000 秒
+    PhysicsSim().run(max_ticks=86400)
