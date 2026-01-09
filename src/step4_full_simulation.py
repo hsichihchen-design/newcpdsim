@@ -21,12 +21,13 @@ class TimeAwareAStar:
         return abs(a[0] - b[0]) + abs(a[1] - b[1])
 
     def find_path(self, start, goal, start_time_sec):
+        # 簡單 A* (含預約表檢查)
         open_set = []
         heapq.heappush(open_set, (0, start, start_time_sec))
         came_from = {}
         g_score = {(start, start_time_sec): 0}
         
-        max_depth = 5000 # 增加搜尋深度以應對繞路
+        max_depth = 3000 # 限制深度，避免死鎖
         steps = 0
         STEP_COST = 1 
 
@@ -54,6 +55,7 @@ class TimeAwareAStar:
                 
                 if 0 <= nr < self.rows and 0 <= nc < self.cols:
                     val = self.grid[nr][nc]
+                    # 允許終點是障礙物(工作站/料架)，但路徑中間不行
                     if val in [1, 2] and (nr, nc) != goal and (nr, nc) != start:
                         continue
                         
@@ -70,11 +72,14 @@ class TimeAwareAStar:
 
 class AdvancedSimulationRunner:
     def __init__(self):
-        print(f"🚀 [Step 4] 啟動進階模擬 (Visualization Ready)...")
+        print(f"🚀 [Step 4] 啟動進階模擬 (Fix: Deadline Timestamp)...")
         
         self.PICK_TIME = 20
+        # 強制讀取地圖，若失敗則報錯
         self.grid_2f = self._load_map('2F_map.xlsx')
         self.grid_3f = self._load_map('3F_map.xlsx')
+        print(f"   -> 2F Map: {self.grid_2f.shape}, 3F Map: {self.grid_3f.shape}")
+        
         self.reservations_2f = set()
         self.reservations_3f = set()
         self.shelf_coords = self._load_shelf_coords()
@@ -88,8 +93,11 @@ class AdvancedSimulationRunner:
 
     def _load_map(self, filename):
         path = os.path.join(BASE_DIR, 'data', 'master', filename)
+        if not os.path.exists(path):
+            print(f"❌ 嚴重錯誤: 找不到地圖檔 {path}")
+            return np.zeros((10,10)) 
         try: return pd.read_excel(path, header=None).fillna(0).values
-        except: return np.zeros((32, 61))
+        except: return np.zeros((10,10))
 
     def _load_shelf_coords(self):
         path = os.path.join(BASE_DIR, 'data', 'mapping', 'shelf_coordinate_map.csv')
@@ -118,22 +126,39 @@ class AdvancedSimulationRunner:
         path = os.path.join(BASE_DIR, 'data', 'transaction', 'wave_orders.csv')
         try:
             df = pd.read_csv(path)
+            # [Fix] 確保 datetime 欄位正確轉型
             df['datetime'] = pd.to_datetime(df['datetime'])
+            
+            # [Fix] 關鍵修正：將 WAVE_DEADLINE 也強制轉型為 datetime
+            if 'WAVE_DEADLINE' in df.columns:
+                df['WAVE_DEADLINE'] = pd.to_datetime(df['WAVE_DEADLINE'], errors='coerce')
+                
             return df.sort_values('datetime').to_dict('records')
-        except: return []
+        except Exception as e:
+            print(f"❌ 訂單讀取失敗: {e}")
+            return []
 
     def _init_stations(self):
         sts = {}
         count = 0
+        # 掃描 2F
         for r in range(self.grid_2f.shape[0]):
             for c in range(self.grid_2f.shape[1]):
                 if self.grid_2f[r][c] == 2:
                     count += 1; sts[count] = {'floor': '2F', 'pos': (r,c), 'free_time': 0}
+        
+        # 掃描 3F (ID 接續)
+        start_3f = count
         for r in range(self.grid_3f.shape[0]):
             for c in range(self.grid_3f.shape[1]):
                 if self.grid_3f[r][c] == 2:
                     count += 1; sts[count] = {'floor': '3F', 'pos': (r,c), 'free_time': 0}
-        if not sts: sts[1] = {'floor': '2F', 'pos': (0,0), 'free_time': 0}
+        
+        if not sts:
+            print("⚠️ 警告: 地圖中未發現工作站 (數值=2)，使用預設座標 (5,5)")
+            sts[1] = {'floor': '2F', 'pos': (5,5), 'free_time': 0}
+        else:
+            print(f"   -> 已識別 {len(sts)} 個工作站")
         return sts
 
     def get_target(self, order):
@@ -141,6 +166,7 @@ class AdvancedSimulationRunner:
         cands = self.inventory_map.get(part, [])
         for sid in cands:
             if sid in self.shelf_coords: return self.shelf_coords[sid]
+        # 隨機 fallback
         if self.shelf_coords:
             import random
             sid = random.choice(list(self.shelf_coords.keys()))
@@ -148,7 +174,9 @@ class AdvancedSimulationRunner:
         return None
 
     def run(self):
-        if not self.orders: return
+        if not self.orders: 
+            print("⚠️ 無訂單資料，模擬結束")
+            return
         
         base_time = self.orders[0]['datetime']
         def to_sec(dt): return int((dt - base_time).total_seconds())
@@ -160,14 +188,18 @@ class AdvancedSimulationRunner:
         astar_2f = TimeAwareAStar(self.grid_2f, self.reservations_2f)
         astar_3f = TimeAwareAStar(self.grid_3f, self.reservations_3f)
         
-        # [NEW] 開啟 Event Log
         f_evt = open(os.path.join(LOG_DIR, 'simulation_events.csv'), 'w', newline='', encoding='utf-8')
         w_evt = csv.writer(f_evt)
         w_evt.writerow(['start_time', 'end_time', 'floor', 'obj_id', 'sx', 'sy', 'ex', 'ey', 'type', 'text'])
 
-        kpi_list = []
+        f_kpi = open(os.path.join(LOG_DIR, 'simulation_kpi.csv'), 'w', newline='', encoding='utf-8')
+        w_kpi = csv.writer(f_kpi)
+        w_kpi.writerow(['finish_time', 'type', 'wave_id', 'is_delayed', 'date', 'workstation'])
+
         count = 0
         reroute_count = 0 
+        
+        total_orders = len(self.orders)
         
         for order in self.orders:
             target = self.get_target(order)
@@ -177,6 +209,7 @@ class AdvancedSimulationRunner:
             shelf_pos = target['pos']
             order_start_sec = to_sec(order['datetime'])
             
+            # 分配資源
             agv_pool = self.agv_state[floor]
             best_agv = min(agv_pool, key=agv_pool.get)
             agv_ready_sec = agv_pool[best_agv]
@@ -189,8 +222,8 @@ class AdvancedSimulationRunner:
             st_pos = self.stations[best_st]['pos']
             
             start_sec = max(order_start_sec, agv_ready_sec, st_ready_sec)
-            if start_sec < 0: start_sec = 0
             
+            # 規劃去程
             astar = astar_2f if floor == '2F' else astar_3f
             res_table = self.reservations_2f if floor == '2F' else self.reservations_3f
             
@@ -199,81 +232,93 @@ class AdvancedSimulationRunner:
             if not path:
                 total_dur = 300 
                 finish_sec = start_sec + total_dur
-                is_rerouted = False
-                is_fail = True
+                arrival_sec = start_sec + 150
             else:
-                is_fail = False
-                manhattan_dist = abs(st_pos[0]-shelf_pos[0]) + abs(st_pos[1]-shelf_pos[1])
-                actual_dist = len(path)
-                is_rerouted = actual_dist > (manhattan_dist + 2)
-                if is_rerouted: reroute_count += 1
+                manhattan = abs(st_pos[0]-shelf_pos[0]) + abs(st_pos[1]-shelf_pos[1])
+                if len(path) > manhattan + 2: reroute_count += 1
                 
-                # [VISUALIZATION] 寫入去程路徑
-                for i in range(len(path) - 1):
-                    curr_pos, curr_t = path[i]
-                    next_pos, next_t = path[i+1]
-                    res_table.add((curr_pos[0], curr_pos[1], curr_t)) # 預約
-                    
-                    w_evt.writerow([
-                        to_dt(curr_t), to_dt(next_t), floor, f"AGV_{best_agv}",
-                        curr_pos[1], curr_pos[0], next_pos[1], next_pos[0], # 注意 X,Y 交換
-                        'AGV_MOVE', ''
-                    ])
+                # [Path Compression] 合併直線移動
+                if len(path) > 1:
+                    seg_start = path[0] 
+                    for i in range(len(path) - 1):
+                        curr_pos, curr_t = path[i]
+                        next_pos, next_t = path[i+1]
+                        
+                        # 預約佔用
+                        res_table.add((curr_pos[0], curr_pos[1], curr_t))
+                        
+                        # 轉彎檢測
+                        if i < len(path) - 2:
+                            nn_pos, _ = path[i+2]
+                            v1 = (next_pos[0]-curr_pos[0], next_pos[1]-curr_pos[1])
+                            v2 = (nn_pos[0]-next_pos[0], nn_pos[1]-next_pos[1])
+                            
+                            if v1 != v2:
+                                # 發生轉彎，寫入一段
+                                w_evt.writerow([
+                                    to_dt(seg_start[1]), to_dt(next_t), floor, f"AGV_{best_agv}",
+                                    seg_start[0][1], seg_start[0][0], next_pos[1], next_pos[0],
+                                    'AGV_MOVE', ''
+                                ])
+                                seg_start = path[i+1]
+                        else:
+                            # 最後一段
+                            w_evt.writerow([
+                                to_dt(seg_start[1]), to_dt(next_t), floor, f"AGV_{best_agv}",
+                                seg_start[0][1], seg_start[0][0], next_pos[1], next_pos[0],
+                                'AGV_MOVE', ''
+                            ])
 
-                # 寫入回程 (簡化: 原路返回，時間往後推)
-                # 到達料架時間
+                # 揀貨
                 pick_end_sec = arrival_sec + self.PICK_TIME
-                
-                # 寫入揀貨事件
                 w_evt.writerow([
                     to_dt(arrival_sec), to_dt(pick_end_sec), floor, f"AGV_{best_agv}",
                     shelf_pos[1], shelf_pos[0], shelf_pos[1], shelf_pos[0],
                     'PICKING', f"Order_{count}"
                 ])
-
-                return_start_sec = pick_end_sec
-                # 回程路徑 (path 是 st -> shelf，所以回程是 reversed path)
-                rev_path = path[::-1] # Shelf -> Station
                 
-                for i in range(len(rev_path) - 1):
-                    # 原始座標
-                    p1_pos, _ = rev_path[i]
-                    p2_pos, _ = rev_path[i+1]
-                    
-                    # 計算回程時間
-                    t1 = return_start_sec + i
-                    t2 = return_start_sec + i + 1
-                    
-                    res_table.add((p1_pos[0], p1_pos[1], t1)) # 預約
-                    
-                    w_evt.writerow([
-                        to_dt(t1), to_dt(t2), floor, f"AGV_{best_agv}",
-                        p1_pos[1], p1_pos[0], p2_pos[1], p2_pos[0],
-                        'AGV_MOVE', ''
-                    ])
-
+                # 回程
+                return_start_sec = pick_end_sec
                 finish_sec = return_start_sec + len(path)
-                total_dur = finish_sec - start_sec
+                
+                for i in range(len(path)):
+                    pos, _ = path[len(path)-1-i]
+                    t = return_start_sec + i
+                    res_table.add((pos[0], pos[1], t))
+                
+                # 回程視覺化 (一段到底)
+                w_evt.writerow([
+                    to_dt(return_start_sec), to_dt(finish_sec), floor, f"AGV_{best_agv}",
+                    shelf_pos[1], shelf_pos[0], st_pos[1], st_pos[0],
+                    'AGV_MOVE', ''
+                ])
 
             self.agv_state[floor][best_agv] = finish_sec
             self.stations[best_st]['free_time'] = finish_sec
             
-            kpi_list.append({
-                'task_id': count,
-                'wave_id': order.get('WAVE_ID', 'N/A'),
-                'floor': floor,
-                'agv': best_agv,
-                'station': best_st,
-                'rerouted': is_rerouted,
-                'start_time': to_dt(start_sec),
-                'finish_time': to_dt(finish_sec),
-                'duration_sec': total_dur
-            })
+            # [Fix] 安全的比較日期
+            is_delayed = 'N'
+            deadline = order.get('WAVE_DEADLINE')
+            # 確保 deadline 是有效時間物件，finish_sec 轉出的時間也是有效物件
+            if pd.notna(deadline):
+                # 如果 deadline 還是字串，這層保險會再轉一次，但理論上 _load_orders 已轉好
+                if isinstance(deadline, str):
+                    try: deadline = pd.to_datetime(deadline)
+                    except: pass
+                
+                if isinstance(deadline, (pd.Timestamp, datetime)):
+                    if to_dt(finish_sec) > deadline:
+                        is_delayed = 'Y'
+                
+            w_kpi.writerow([
+                to_dt(finish_sec), 'PICKING', order.get('WAVE_ID', 'N/A'),
+                is_delayed, to_dt(finish_sec).date(), f"WS_{best_st}"
+            ])
             
             count += 1
-            if count % 1000 == 0:
-                print(f"\r🚀 進度: {count}/{len(self.orders)} | 繞路: {reroute_count}", end='')
-                # 記憶體清理
+            if count % 2000 == 0:
+                print(f"\r🚀 進度: {count}/{total_orders} | 繞路: {reroute_count}", end='')
+                
                 limit_t = start_sec - 3600
                 if floor == '2F':
                     self.reservations_2f = {r for r in self.reservations_2f if r[2] > limit_t}
@@ -283,9 +328,9 @@ class AdvancedSimulationRunner:
                     astar_3f.reservations = self.reservations_3f
 
         f_evt.close()
+        f_kpi.close()
         print(f"\n✅ 模擬完成！耗時 {time.time() - start_real:.2f} 秒")
-        pd.DataFrame(kpi_list).to_csv(os.path.join(LOG_DIR, 'simulation_kpi.csv'), index=False)
-        print("💾 資料已輸出: simulation_kpi.csv, simulation_events.csv")
+        print("💾 資料已輸出 (已壓縮): simulation_kpi.csv, simulation_events.csv")
 
 if __name__ == "__main__":
     AdvancedSimulationRunner().run()
