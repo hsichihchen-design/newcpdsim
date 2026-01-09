@@ -73,7 +73,7 @@ class TimeAwareAStar:
 
 class AdvancedSimulationRunner:
     def __init__(self):
-        print(f"🚀 [Step 4] 啟動進階模擬 (Date Check & Sort Fix)...")
+        print(f"🚀 [Step 4] 啟動進階模擬 (KPI Enhanced)...")
         
         self.PICK_TIME = 20
         self.grid_2f = self._load_map('2F_map.xlsx')
@@ -82,16 +82,7 @@ class AdvancedSimulationRunner:
         self.reservations_3f = set()
         self.shelf_coords = self._load_shelf_coords()
         self.inventory_map = self._load_inventory()
-        
-        # 載入任務
         self.orders = self._load_all_tasks()
-        
-        # [DEBUG] 檢查日期範圍
-        if self.orders:
-            min_date = self.orders[0]['datetime']
-            max_date = self.orders[-1]['datetime']
-            print(f"   📅 任務日期範圍: {min_date} ~ {max_date}")
-            print(f"   ⚠️ 如果範圍超過預期 (例如 7/1~7/5)，請檢查 data/transaction/wave_orders.csv 是否包含舊資料。")
         
         print("   -> 初始化車隊: 2F(18台), 3F(18台)")
         self.agv_state = {
@@ -105,7 +96,6 @@ class AdvancedSimulationRunner:
         
         for o in self.orders:
             wid = str(o.get('WAVE_ID', 'UNKNOWN')) 
-            # 統一日期格式為 YYYY-MM-DD 以便比對
             d_str = o['datetime'].strftime('%Y-%m-%d')
             
             if 'RECEIVING' in wid:
@@ -198,10 +188,8 @@ class AdvancedSimulationRunner:
             part_col = next((c for c in cols if 'ITEM' in c or 'PART' in c), None)
             
             if date_col and part_col:
-                # 統一進貨時間為 09:00:00，確保在當天開始
                 df_in['datetime'] = pd.to_datetime(df_in[date_col]) + timedelta(hours=9)
                 df_in = df_in.dropna(subset=['datetime'])
-                
                 df_in['PARTNO'] = df_in[part_col]
                 df_in['WAVE_ID'] = 'RECEIVING_' + df_in['datetime'].dt.strftime('%Y%m%d')
                 df_in['WAVE_DEADLINE'] = pd.NaT 
@@ -285,7 +273,9 @@ class AdvancedSimulationRunner:
         w_evt.writerow(['start_time', 'end_time', 'floor', 'obj_id', 'sx', 'sy', 'ex', 'ey', 'type', 'text'])
         f_kpi = open(os.path.join(LOG_DIR, 'simulation_kpi.csv'), 'w', newline='', encoding='utf-8')
         w_kpi = csv.writer(f_kpi)
-        w_kpi.writerow(['finish_time', 'type', 'wave_id', 'is_delayed', 'date', 'workstation', 'total_in_wave'])
+        
+        # [Fix] 增加 deadline_ts 欄位
+        w_kpi.writerow(['finish_time', 'type', 'wave_id', 'is_delayed', 'date', 'workstation', 'total_in_wave', 'deadline_ts'])
 
         count = 0
         total_orders = len(self.orders)
@@ -367,7 +357,9 @@ class AdvancedSimulationRunner:
             
             is_delayed = 'N'
             deadline = order.get('WAVE_DEADLINE')
+            deadline_ts = 0
             if pd.notna(deadline) and isinstance(deadline, (pd.Timestamp, datetime)):
+                 deadline_ts = int(deadline.timestamp())
                  if self.to_dt(finish_sec) > deadline: is_delayed = 'Y'
             
             status_text = f"{status_color}|{wave_id}|{is_delayed}"
@@ -389,7 +381,7 @@ class AdvancedSimulationRunner:
                 
             w_kpi.writerow([
                 self.to_dt(finish_sec), 'PICKING' if task_type=='OUTBOUND' else 'RECEIVING', wave_id,
-                is_delayed, self.to_dt(finish_sec).date(), f"WS_{best_st}", total_in_wave
+                is_delayed, self.to_dt(finish_sec).date(), f"WS_{best_st}", total_in_wave, deadline_ts
             ])
             
             count += 1

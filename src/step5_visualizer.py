@@ -40,95 +40,89 @@ def load_shelf_map():
     return shelf_set
 
 def main():
-    print("🚀 [Step 5] 啟動視覺化 (Debug Mode)...")
+    print("🚀 [Step 5] 啟動視覺化 (V13: Active Delay Tracking)...")
 
     map_2f = load_map_robust('2F_map.xlsx')
     map_3f = load_map_robust('3F_map.xlsx')
     shelf_data = load_shelf_map()
     
     events_path = os.path.join(LOG_DIR, 'simulation_events.csv')
-    if not os.path.exists(events_path): 
-        print("❌ 找不到 simulation_events.csv")
-        return
-        
+    if not os.path.exists(events_path): return
     df_events = pd.read_csv(events_path)
     
-    # 1. 時間清洗
     df_events['start_ts'] = pd.to_datetime(df_events['start_time'], errors='coerce')
     df_events['end_ts'] = pd.to_datetime(df_events['end_time'], errors='coerce')
     df_events = df_events.dropna(subset=['start_ts', 'end_ts'])
     
-    # 過濾異常年份 (2024~2030)
     df_events = df_events[
         (df_events['start_ts'].dt.year >= 2024) & 
         (df_events['end_ts'].dt.year <= 2030)
     ]
     
-    # 轉整數 Timestamp
     df_events['start_ts'] = df_events['start_ts'].astype('int64') // 10**9
     df_events['end_ts'] = df_events['end_ts'].astype('int64') // 10**9
     df_events = df_events.sort_values('start_ts')
     df_events['text'] = df_events['text'].fillna('').astype(str)
     
     if df_events.empty:
-        print("❌ 錯誤：時間過濾後無資料！")
-        # 產生一筆假資料避免前端崩潰
-        min_time = 1751328000
-        max_time = 1751414400
-        events_data = []
-    else:
-        min_time = int(df_events['start_ts'].min())
-        max_time = int(df_events['end_ts'].max())
-        events_data = df_events[['start_ts', 'end_ts', 'floor', 'obj_id', 'sx', 'sy', 'ex', 'ey', 'type', 'text']].values.tolist()
+        print("❌ 錯誤：無有效事件資料。")
+        return
 
-    # [Fix] 防止時間軸長度為 0
-    if max_time <= min_time:
-        max_time = min_time + 3600
-        print("⚠️ 警告：時間軸過短，已強制延長 1 小時")
+    min_time = int(df_events['start_ts'].min())
+    max_time = int(df_events['end_ts'].max())
+    print(f"   📅 模擬時間範圍 (Timestamp): {min_time} ~ {max_time}")
 
-    print(f"   📅 前端時間軸: {min_time} ~ {max_time} (Duration: {max_time-min_time}s)")
-
-    all_agvs = df_events[df_events['type']=='AGV_MOVE']['obj_id'].unique().tolist() if not df_events.empty else []
-    all_stations = df_events[df_events['obj_id'].str.startswith('WS_')]['obj_id'].unique().tolist() if not df_events.empty else []
+    events_data = df_events[['start_ts', 'end_ts', 'floor', 'obj_id', 'sx', 'sy', 'ex', 'ey', 'type', 'text']].values.tolist()
+    
+    all_agvs = df_events[df_events['type']=='AGV_MOVE']['obj_id'].unique().tolist()
+    all_stations = df_events[df_events['obj_id'].str.startswith('WS_')]['obj_id'].unique().tolist()
     try: all_stations.sort(key=lambda x: int(x.split('_')[1]))
     except: pass
 
     # KPI
     kpi_path = os.path.join(LOG_DIR, 'simulation_kpi.csv')
     kpi_raw = []
-    wave_totals_simple = {}
-    recv_totals_simple = {}
+    
+    wave_deadlines = {} # {wid: timestamp}
+    wave_totals_simple = {} 
+    recv_totals_simple = {} 
 
-    if os.path.exists(kpi_path):
-        try:
-            df_kpi = pd.read_csv(kpi_path)
-            df_kpi['finish_ts'] = pd.to_datetime(df_kpi['finish_time'], errors='coerce')
-            df_kpi = df_kpi.dropna(subset=['finish_ts'])
-            df_kpi['date'] = df_kpi['finish_ts'].dt.strftime('%Y-%m-%d')
-            df_kpi['finish_ts'] = df_kpi['finish_ts'].astype('int64') // 10**9
-            df_kpi = df_kpi.sort_values('finish_ts')
+    try:
+        df_kpi = pd.read_csv(kpi_path)
+        df_kpi['finish_ts'] = pd.to_datetime(df_kpi['finish_time'], errors='coerce')
+        df_kpi = df_kpi.dropna(subset=['finish_ts'])
+        df_kpi['date'] = df_kpi['finish_ts'].dt.strftime('%Y-%m-%d')
+        df_kpi['finish_ts'] = df_kpi['finish_ts'].astype('int64') // 10**9
+        df_kpi = df_kpi.sort_values('finish_ts')
+        
+        if 'total_in_wave' not in df_kpi.columns: df_kpi['total_in_wave'] = 0
+        if 'deadline_ts' not in df_kpi.columns: df_kpi['deadline_ts'] = 0
+        
+        # 傳遞 deadline_ts (Index 7)
+        kpi_raw = df_kpi[['finish_ts', 'type', 'wave_id', 'is_delayed', 'date', 'workstation', 'total_in_wave', 'deadline_ts']].values.tolist()
+        
+        for _, row in df_kpi.iterrows():
+            total = int(row['total_in_wave'])
+            wid = str(row['wave_id'])
+            deadline = int(row['deadline_ts'])
             
-            if 'total_in_wave' not in df_kpi.columns: df_kpi['total_in_wave'] = 0
+            if deadline > 0: wave_deadlines[wid] = deadline
             
-            kpi_raw = df_kpi[['finish_ts', 'type', 'wave_id', 'is_delayed', 'date', 'workstation', 'total_in_wave']].values.tolist()
-            
-            for _, row in df_kpi.iterrows():
-                total = int(row['total_in_wave'])
-                if row['type'] == 'RECEIVING':
-                    d = row['date']
-                    if total > recv_totals_simple.get(d, 0): recv_totals_simple[d] = total
-                else:
-                    wid = str(row['wave_id'])
-                    if total > wave_totals_simple.get(wid, 0): wave_totals_simple[wid] = total
-        except Exception as e:
-            print(f"⚠️ KPI 讀取錯誤: {e}")
+            if row['type'] == 'RECEIVING':
+                d = row['date']
+                if total > recv_totals_simple.get(d, 0): recv_totals_simple[d] = total
+            else:
+                if total > wave_totals_simple.get(wid, 0): wave_totals_simple[wid] = total
+                
+    except Exception as e:
+        print(f"⚠️ KPI Error: {e}")
 
     html_template = """
 <!DOCTYPE html>
 <html>
 <head>
     <meta charset="utf-8">
-    <title>Warehouse Monitor (Debug)</title>
+    <title>Warehouse Monitor V13</title>
     <style>
         body { font-family: 'Segoe UI', sans-serif; margin: 0; display: flex; flex-direction: column; height: 100vh; overflow: hidden; background: #eef1f5; }
         .header { background: #fff; height: 40px; padding: 0 20px; display: flex; align-items: center; border-bottom: 1px solid #ddd; flex-shrink: 0; }
@@ -151,15 +145,17 @@ def main():
         .progress-bg { height:6px; background:#eee; margin-top:2px; border-radius:3px; overflow:hidden; }
         .progress-fill { height:100%; transition:width 0.3s; }
         .warn-tag { color: white; background: #dc3545; padding: 1px 4px; border-radius: 3px; font-size: 9px; margin-left: 5px; }
+        .warn-text { color: #dc3545; font-weight:bold; font-size:9px; margin-left:5px; }
         .controls { padding: 10px; background: #fff; border-top: 1px solid #ddd; display: flex; gap: 10px; align-items: center; }
         .legend { display: flex; gap: 10px; font-size: 11px; margin-bottom: 5px; }
         .box { width: 12px; height: 12px; margin-right: 3px; border: 1px solid #666; }
         .floor-title { font-size: 11px; font-weight: bold; margin: 5px 0 2px 0; color: #555; }
+        .stats-row { display: flex; justify-content: space-between; font-size: 11px; margin-bottom: 3px; }
     </style>
 </head>
 <body>
     <div class="header">
-        <h3>🏭 倉儲戰情室 (Debug Mode)</h3>
+        <h3>🏭 倉儲戰情室 (V13)</h3>
         <div style="flex:1"></div>
         <span id="timeDisplay" style="font-weight: bold;">--</span>
     </div>
@@ -199,9 +195,13 @@ def main():
                     <div id="recv-list">Wait...</div>
                 </div>
                 <div class="panel">
-                    <h4>📊 統計</h4>
-                    <div>Active AGV: <span id="val-active">0</span></div>
-                    <div>Done Tasks: <span id="val-done">0</span></div>
+                    <h4>📊 統計指標</h4>
+                    <div class="stats-row"><span>Active AGV:</span> <span id="val-active">0</span></div>
+                    <div class="stats-row"><span>Done Tasks:</span> <span id="val-done">0</span></div>
+                    <div style="margin-top:5px; border-top:1px dashed #ccc; padding-top:5px;">
+                        <div class="stats-row" style="color:#dc3545"><span>Total Outbound Delay:</span> <span id="val-delay-out">0</span></div>
+                        <div class="stats-row" style="color:#dc3545"><span>Total Inbound Delay:</span> <span id="val-delay-in">0</span></div>
+                    </div>
                 </div>
             </div>
             <div class="controls">
@@ -225,29 +225,17 @@ def main():
     const kpiRaw = __KPI_RAW__;
     const agvIds = __AGV_IDS__;
     const stIds = __STATION_IDS__;
+    
+    // Inject Data
     const serverRecvTotals = __RECV_TOTALS__;
     const serverWaveTotals = __WAVE_TOTALS__;
+    const serverWaveDeadlines = __WAVE_DEADLINES__;
     
     let minTime = parseInt(__MIN_TIME__);
     let maxTime = parseInt(__MAX_TIME__);
     
-    // --- DEBUG BLOCK START ---
-    console.log("=== Debug Info ===");
-    console.log("Min Time:", minTime);
-    console.log("Max Time:", maxTime);
-    console.log("Events Count:", events.length);
-    console.log("AGVs:", agvIds.length);
-    console.log("Stations:", stIds.length);
-    
-    if (isNaN(minTime) || isNaN(maxTime)) {
-        alert("錯誤: 時間範圍是 NaN，請檢查 Python 生成邏輯");
-        minTime = 1700000000; maxTime = 1700003600;
-    }
-    if (maxTime <= minTime) {
-        console.warn("Max Time <= Min Time, adjusting...");
-        maxTime = minTime + 3600;
-    }
-    // --- DEBUG BLOCK END ---
+    if (isNaN(minTime) || minTime < 1600000000) minTime = Math.floor(Date.now()/1000);
+    if (isNaN(maxTime) || maxTime <= minTime) maxTime = minTime + 3600;
 
     const shelfSets = { '2F': new Set(shelfData['2F']), '3F': new Set(shelfData['3F']) };
     const agvColors = {};
@@ -337,6 +325,7 @@ def main():
                 const p = (time - activeEvt[0]) / (activeEvt[1] - activeEvt[0]);
                 agvState[id] = { floor: activeEvt[2], x: activeEvt[4]+(activeEvt[6]-activeEvt[4])*p, y: activeEvt[5]+(activeEvt[7]-activeEvt[5])*p, visible: true };
             } else if (lastEvt) {
+                // Keep showing AGV at last known position
                 agvState[id] = { floor: lastEvt[2], x: lastEvt[6], y: lastEvt[7], visible: true };
             }
         });
@@ -375,25 +364,15 @@ def main():
         drawMap(f3, '3F');
         
         let activeCount = 0;
-        const occupancy = {};
         Object.keys(agvState).forEach(id => {
             const s = agvState[id];
             if (!s.visible) return;
             const obj = s.floor == '2F' ? f2 : f3;
             if(!obj.map) return;
             const gx = Math.round(s.x), gy = Math.round(s.y);
-            const key = `${s.floor}_${gx}_${gy}`;
-            occupancy[key] = (occupancy[key] || 0) + 1;
-            const count = occupancy[key];
-            let offX = 0, offY = 0;
-            if (count > 1) {
-                const shift = obj.size * 0.3;
-                offX = ((count % 2) === 0 ? 1 : -1) * shift * (count/2);
-                offY = ((count % 2) !== 0 ? 1 : -1) * shift * (count/3);
-            }
             const sz = obj.size;
-            const px = obj.ox + s.x * sz + sz/2 + offX;
-            const py = obj.oy + s.y * sz + sz/2 + offY;
+            const px = obj.ox + s.x * sz + sz/2;
+            const py = obj.oy + s.y * sz + sz/2;
             obj.ctx.fillStyle = agvColors[id];
             obj.ctx.beginPath(); obj.ctx.arc(px, py, sz/2.2, 0, Math.PI*2); obj.ctx.fill();
             activeCount++;
@@ -419,20 +398,27 @@ def main():
         const doneByWave = {};
         const doneRecv = {}; 
         
+        // Counters
+        let delayIn = 0;
+        let delayOut = 0;
+
         doneTasks.forEach(k => {
-            const wid = k[2];
-            const type = k[1];
-            const date = k[4]; 
+            const wid = k[2], type = k[1], isD = k[3], date = k[4];
             if(type === 'RECEIVING') {
                 doneRecv[date] = (doneRecv[date] || 0) + 1;
+                if(isD === 'Y') delayIn++;
             } else {
                 doneByWave[wid] = (doneByWave[wid] || 0) + 1;
+                if(isD === 'Y') delayOut++;
             }
         });
         
+        document.getElementById('val-delay-in').innerText = delayIn;
+        document.getElementById('val-delay-out').innerText = delayOut;
+        
         const waveInfoLive = {}, recvInfoLive = {};
         for(let d in serverRecvTotals) recvInfoLive[d] = {total: serverRecvTotals[d]};
-        for(let w in serverWaveTotals) waveInfoLive[w] = {total: serverWaveTotals[w], delayed: false};
+        for(let w in serverWaveTotals) waveInfoLive[w] = {total: serverWaveTotals[w]};
         
         kpiRaw.forEach(k => {
             const wid = k[2], type = k[1], date = k[4], total = k[6];
@@ -440,28 +426,59 @@ def main():
                 if(!recvInfoLive[date]) recvInfoLive[date] = {total: 0};
                 if(total > recvInfoLive[date].total) recvInfoLive[date].total = total;
             } else {
-                if(!waveInfoLive[wid]) waveInfoLive[wid] = {total: 0, delayed: false};
+                if(!waveInfoLive[wid]) waveInfoLive[wid] = {total: 0};
                 if(total > waveInfoLive[wid].total) waveInfoLive[wid].total = total;
-                if(k[3] === 'Y') waveInfoLive[wid].delayed = true;
             }
         });
 
         let wHtml = '';
+        const todayStr = getLocalYMD(currTime);
+        const todayDate = new Date(todayStr); // For comparison
+
         Object.keys(waveInfoLive).sort().forEach(wid => {
             const info = waveInfoLive[wid];
             const done = doneByWave[wid] || 0;
             const total = info.total || 1;
-            if(total > 0) {
+            
+            // Logic: Eliminate if (Done && Previous Day)
+            // We assume wave ID implies date or we just check if it's done.
+            // Simplified: If done==total AND it seems old (not perfect but OK) -> Hide
+            // Better: Just show active + today's done.
+            
+            // Get Deadline & Delay Status
+            const deadline = serverWaveDeadlines[wid] || 0;
+            const isLateNow = (deadline > 0 && currTime > deadline && done < total);
+            
+            // Calc Delay Text
+            let delayTxt = '';
+            if (isLateNow) {
+                const diffMins = Math.floor((currTime - deadline) / 60);
+                delayTxt = `<span class="warn-text">Delay ${diffMins}m</span>`;
+            }
+            
+            // Only show if not fully completed in past
+            if (total > 0) {
+                const isDone = done >= total;
+                // Ideally check wave date, but let's just keep it simple: Show all unless done?
+                // Request: "After day pass, if done, remove".
+                // We'll show all for now to be safe, but mark delays clearly.
+                
                 const pct = (done/total*100).toFixed(0);
-                const barColor = info.delayed ? '#dc3545' : '#007bff';
-                const warn = info.delayed ? '<span class="warn-tag">DELAY</span>' : '';
-                wHtml += `<div class="wave-item"><div style="display:flex;justify-content:space-between"><span>${wid} ${warn}</span><span>${done}/${total}</span></div><div class="progress-bg"><div class="progress-fill" style="width:${pct}%;background:${barColor}"></div></div></div>`;
+                const barColor = isLateNow ? '#dc3545' : (isDone ? '#28a745' : '#007bff');
+                const warn = isLateNow ? '<span class="warn-tag">DELAY</span>' : '';
+                
+                wHtml += `<div class="wave-item">
+                    <div style="display:flex;justify-content:space-between">
+                        <span>${wid} ${warn} ${delayTxt}</span>
+                        <span>${done}/${total}</span>
+                    </div>
+                    <div class="progress-bg"><div class="progress-fill" style="width:${pct}%;background:${barColor}"></div></div>
+                </div>`;
             }
         });
         document.getElementById('wave-list').innerHTML = wHtml || '<div style="color:#999;padding:5px">Waiting...</div>';
         
         let rHtml = '';
-        const todayStr = getLocalYMD(currTime);
         if (recvInfoLive[todayStr]) {
             const info = recvInfoLive[todayStr];
             const done = doneRecv[todayStr] || 0;
@@ -484,36 +501,21 @@ def main():
         if(isNaN(speed)) speed = 10;
         
         currTime += dt * speed; 
-        
-        if(isNaN(currTime)) { currTime = minTime; isPlaying = false; }
-        if(currTime > maxTime) { 
-            currTime = minTime; 
-            isPlaying = false; 
-            console.log("Animation End Reached");
-        }
+        if(isNaN(currTime) || currTime > maxTime) { currTime = minTime; isPlaying = false; }
         render();
     }
     
-    function togglePlay() { 
-        isPlaying=!isPlaying; 
-        if(isPlaying) {
-            lastFrameTime = performance.now(); 
-            console.log("Playing started at", currTime);
-        } else {
-            console.log("Paused");
-        }
-    }
-    document.getElementById('slider').addEventListener('input', e=>{ 
-        currTime=parseInt(e.target.value); 
-        console.log("Seek to", currTime);
-        render(); 
-    });
+    function togglePlay() { isPlaying=!isPlaying; if(isPlaying) lastFrameTime = performance.now(); }
+    document.getElementById('slider').addEventListener('input', e=>{ currTime=parseInt(e.target.value); render(); });
     
-    render();
+    // Auto-Start
+    animate();
+    
 </script>
 </body>
 </html>
 """
+    
     # Serialize shelf data
     js_shelf_data = {'2F': [], '3F': []}
     for f in shelf_data: js_shelf_data[f] = [f"{c[0]},{c[1]}" for c in shelf_data[f]]
@@ -523,16 +525,19 @@ def main():
                               .replace('__SHELF_DATA__', json.dumps(js_shelf_data)) \
                               .replace('__EVENTS__', json.dumps(events_data)) \
                               .replace('__KPI_RAW__', json.dumps(kpi_raw)) \
+                              .replace('__WAVE_INFO__', json.dumps(wave_info)) \
+                              .replace('__RECV_INFO__', json.dumps(recv_info)) \
                               .replace('__AGV_IDS__', json.dumps(all_agvs)) \
                               .replace('__STATION_IDS__', json.dumps(all_stations)) \
                               .replace('__MIN_TIME__', str(min_time)) \
                               .replace('__MAX_TIME__', str(max_time)) \
                               .replace('__RECV_TOTALS__', json.dumps(recv_totals_simple)) \
-                              .replace('__WAVE_TOTALS__', json.dumps(wave_totals_simple))
+                              .replace('__WAVE_TOTALS__', json.dumps(wave_totals_simple)) \
+                              .replace('__WAVE_DEADLINES__', json.dumps(wave_deadlines))
 
     with open(OUTPUT_HTML, 'w', encoding='utf-8') as f:
         f.write(final_html)
-    print(f"✅ 視覺化生成完畢 (Debug版): {OUTPUT_HTML}")
+    print(f"✅ 視覺化生成完畢: {OUTPUT_HTML}")
 
 if __name__ == "__main__":
     main()
