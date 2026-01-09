@@ -3,50 +3,34 @@ import numpy as np
 import os
 
 BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-DATA_MAP_DIR = os.path.join(BASE_DIR, 'data', 'master')
 
-def check_map(filename):
-    print(f"🔍 正在檢查地圖: {filename} ...")
-    path = os.path.join(DATA_MAP_DIR, filename)
-    if not os.path.exists(path):
-        print("   ❌ 檔案不存在！")
-        return
-
-    # 嘗試讀取
-    df = pd.read_excel(path, header=None).fillna(0)
-    grid = df.values
+def check_maps():
+    print("🔍 檢查地圖檔案與讀取狀態...")
     
-    # 強制轉型測試
-    try:
-        grid = grid.astype(int)
-    except:
-        print("   ⚠️ 警告: 地圖包含非數字字元，這可能導致判讀錯誤！")
-    
-    unique, counts = np.unique(grid, return_counts=True)
-    stats = dict(zip(unique, counts))
-    
-    print(f"   -> 地圖大小: {grid.shape}")
-    print(f"   -> 內容統計: {stats}")
-    
-    # 檢查關鍵物件
-    ws_count = stats.get(2, 0) # 工作站
-    shelf_count = stats.get(1, 0) # 料架
-    
-    if ws_count == 0:
-        print("   ❌ 嚴重錯誤: 找不到任何工作站 (代號 2)！AGV 會因此卡在 (0,0)。")
-        print("      請檢查 Excel 中工作站是否填寫正確，或是否被存為文字格式。")
+    # 檢查 2F
+    path_2f = os.path.join(BASE_DIR, 'data', 'master', '2F_map.xlsx')
+    if os.path.exists(path_2f):
+        try:
+            df = pd.read_excel(path_2f, header=None)
+            grid = df.fillna(0).values
+            print(f"✅ 2F 地圖讀取成功！大小: {grid.shape}")
+            print(f"   -> 內容預覽 (Top Left 5x5):\n{grid[:5, :5]}")
+        except Exception as e:
+            print(f"❌ 2F 地圖存在但讀取失敗: {e}")
     else:
-        print(f"   ✅ 偵測到 {ws_count} 格工作站。")
-        # 印出前幾個座標看看是否合理
-        rows, cols = np.where(grid == 2)
-        print(f"      範例座標 (Row, Col): {list(zip(rows[:3], cols[:3]))}")
+        print(f"❌ 找不到 2F 地圖檔案: {path_2f}")
 
-    if shelf_count == 0:
-        print("   ❌ 嚴重錯誤: 找不到任何料架 (代號 1)！")
+    # 檢查 3F
+    path_3f = os.path.join(BASE_DIR, 'data', 'master', '3F_map.xlsx')
+    if os.path.exists(path_3f):
+        try:
+            df = pd.read_excel(path_3f, header=None)
+            grid = df.fillna(0).values
+            print(f"✅ 3F 地圖讀取成功！大小: {grid.shape}")
+        except Exception as e:
+            print(f"❌ 3F 地圖存在但讀取失敗: {e}")
     else:
-        print(f"   ✅ 偵測到 {shelf_count} 格料架。")
-    print("-" * 30)
+        print(f"❌ 找不到 3F 地圖檔案: {path_3f}")
 
 if __name__ == "__main__":
-    check_map('2F_map.xlsx')
-    check_map('3F_map.xlsx')
+    check_maps()
