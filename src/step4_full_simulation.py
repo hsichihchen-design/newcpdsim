@@ -73,7 +73,7 @@ class TimeAwareAStar:
 
 class AdvancedSimulationRunner:
     def __init__(self):
-        print(f"🚀 [Step 4] 啟動進階模擬 (Fix NaN DateTime)...")
+        print(f"🚀 [Step 4] 啟動進階模擬 (Date Check & Sort Fix)...")
         
         self.PICK_TIME = 20
         self.grid_2f = self._load_map('2F_map.xlsx')
@@ -82,7 +82,16 @@ class AdvancedSimulationRunner:
         self.reservations_3f = set()
         self.shelf_coords = self._load_shelf_coords()
         self.inventory_map = self._load_inventory()
+        
+        # 載入任務
         self.orders = self._load_all_tasks()
+        
+        # [DEBUG] 檢查日期範圍
+        if self.orders:
+            min_date = self.orders[0]['datetime']
+            max_date = self.orders[-1]['datetime']
+            print(f"   📅 任務日期範圍: {min_date} ~ {max_date}")
+            print(f"   ⚠️ 如果範圍超過預期 (例如 7/1~7/5)，請檢查 data/transaction/wave_orders.csv 是否包含舊資料。")
         
         print("   -> 初始化車隊: 2F(18台), 3F(18台)")
         self.agv_state = {
@@ -93,11 +102,14 @@ class AdvancedSimulationRunner:
         
         self.wave_totals = {}
         self.recv_totals = {}
+        
         for o in self.orders:
-            wid = str(o.get('WAVE_ID', 'UNKNOWN'))
+            wid = str(o.get('WAVE_ID', 'UNKNOWN')) 
+            # 統一日期格式為 YYYY-MM-DD 以便比對
+            d_str = o['datetime'].strftime('%Y-%m-%d')
+            
             if 'RECEIVING' in wid:
-                d = o['datetime'].strftime('%Y-%m-%d')
-                self.recv_totals[d] = self.recv_totals.get(d, 0) + 1
+                self.recv_totals[d_str] = self.recv_totals.get(d_str, 0) + 1
             else:
                 self.wave_totals[wid] = self.wave_totals.get(wid, 0) + 1
 
@@ -172,9 +184,7 @@ class AdvancedSimulationRunner:
         try:
             df_out = pd.read_csv(path_out)
             df_out['datetime'] = pd.to_datetime(df_out['datetime'])
-            # [Fix] Drop NaT datetimes immediately
             df_out = df_out.dropna(subset=['datetime'])
-            
             if 'WAVE_DEADLINE' in df_out.columns:
                 df_out['WAVE_DEADLINE'] = pd.to_datetime(df_out['WAVE_DEADLINE'], errors='coerce')
             tasks.extend(df_out.to_dict('records'))
@@ -188,8 +198,9 @@ class AdvancedSimulationRunner:
             part_col = next((c for c in cols if 'ITEM' in c or 'PART' in c), None)
             
             if date_col and part_col:
+                # 統一進貨時間為 09:00:00，確保在當天開始
                 df_in['datetime'] = pd.to_datetime(df_in[date_col]) + timedelta(hours=9)
-                df_in = df_in.dropna(subset=['datetime']) # [Fix] Drop NaT
+                df_in = df_in.dropna(subset=['datetime'])
                 
                 df_in['PARTNO'] = df_in[part_col]
                 df_in['WAVE_ID'] = 'RECEIVING_' + df_in['datetime'].dt.strftime('%Y%m%d')
@@ -289,7 +300,6 @@ class AdvancedSimulationRunner:
         st_ref_3f = find_first_st('3F')
 
         for order in self.orders:
-            # [Fix] NaN check inside loop too
             if pd.isna(order.get('datetime')): continue
             order_start_sec = to_sec(order['datetime'])
             

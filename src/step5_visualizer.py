@@ -39,7 +39,7 @@ def load_shelf_map():
     return shelf_set
 
 def main():
-    print("🚀 [Step 5] 啟動視覺化 (Real-Time Speed Control)...")
+    print("🚀 [Step 5] 啟動視覺化 (Fix Date Format & Sorting)...")
 
     map_2f = load_map_robust('2F_map.xlsx')
     map_3f = load_map_robust('3F_map.xlsx')
@@ -62,7 +62,7 @@ def main():
     try: all_stations.sort(key=lambda x: int(x.split('_')[1]))
     except: pass
 
-    # KPI
+    # KPI Analysis
     kpi_path = os.path.join(LOG_DIR, 'simulation_kpi.csv')
     kpi_raw = []
     wave_info = {} 
@@ -70,43 +70,46 @@ def main():
     try:
         df_kpi = pd.read_csv(kpi_path)
         df_kpi['finish_ts'] = pd.to_datetime(df_kpi['finish_time'], format='mixed').astype('int64') // 10**9
-        df_kpi['date'] = pd.to_datetime(df_kpi['finish_time'], format='mixed').dt.date.astype(str)
+        
+        # [Fix] 強制標準化日期格式 (YYYY-MM-DD)
+        df_kpi['date'] = pd.to_datetime(df_kpi['finish_time'], format='mixed').dt.strftime('%Y-%m-%d')
+        
         if 'total_in_wave' not in df_kpi.columns: df_kpi['total_in_wave'] = 0
         
-        kpi_raw = df_kpi[['finish_ts', 'type', 'wave_id', 'is_delayed', 'date', 'workstation']].values.tolist()
+        # [Fix] 強制排序
+        df_kpi = df_kpi.sort_values('finish_ts')
+        
+        kpi_raw = df_kpi[['finish_ts', 'type', 'wave_id', 'is_delayed', 'date', 'workstation', 'total_in_wave']].values.tolist()
         
         for _, row in df_kpi.iterrows():
             wid = str(row['wave_id'])
-            # 區分 Receiving 與 Wave
+            total = int(row['total_in_wave'])
+            
             if 'RECEIVING' in wid:
                 d = str(row['date'])
-                if d not in recv_info: recv_info[d] = {'total': int(row['total_in_wave']), 'done': 0}
-                if row['total_in_wave'] > recv_info[d]['total']: recv_info[d]['total'] = int(row['total_in_wave'])
-                recv_info[d]['done'] += 1
+                if d not in recv_info: recv_info[d] = {'total': 0, 'done': 0} # Init structure
+                if total > recv_info[d]['total']: recv_info[d]['total'] = total
             else:
-                if wid not in wave_info:
-                    wave_info[wid] = {'total': int(row['total_in_wave']), 'delayed': 0}
-                if row['total_in_wave'] > wave_info[wid]['total']: 
-                     wave_info[wid]['total'] = int(row['total_in_wave'])
+                if wid not in wave_info: wave_info[wid] = {'total': total, 'delayed': 0}
+                if total > wave_info[wid]['total']: wave_info[wid]['total'] = total
                 if row['is_delayed'] == 'Y': wave_info[wid]['delayed'] += 1
-    except: pass
+                
+    except Exception as e:
+        print(f"⚠️ KPI 讀取錯誤: {e}")
 
     html_template = """
 <!DOCTYPE html>
 <html>
 <head>
     <meta charset="utf-8">
-    <title>Warehouse Monitor V5</title>
+    <title>Warehouse Monitor V7 (Stable)</title>
     <style>
         body { font-family: 'Segoe UI', sans-serif; margin: 0; display: flex; flex-direction: column; height: 100vh; overflow: hidden; background: #eef1f5; }
         .header { background: #fff; height: 40px; padding: 0 20px; display: flex; align-items: center; border-bottom: 1px solid #ddd; flex-shrink: 0; }
         .main { display: flex; flex: 1; overflow: hidden; }
         
         .map-section { flex: 3; display: flex; flex-direction: column; padding: 10px; gap: 10px; overflow: hidden; }
-        .floor-container { 
-            flex: 1; background: #fff; border: 1px solid #ccc; position: relative; 
-            display: flex; flex-direction: column; overflow: hidden; 
-        }
+        .floor-container { flex: 1; background: #fff; border: 1px solid #ccc; position: relative; display: flex; flex-direction: column; overflow: hidden; }
         .floor-label { position: absolute; top: 5px; left: 5px; background: rgba(255,255,255,0.9); padding: 2px 6px; font-weight: bold; font-size: 12px; z-index: 10; border: 1px solid #999; }
         .canvas-wrap { flex: 1; width: 100%; height: 100%; position: relative; }
         canvas { display: block; width: 100%; height: 100%; }
@@ -117,10 +120,7 @@ def main():
         .panel h4 { margin: 0 0 8px 0; border-bottom: 2px solid #007bff; font-size: 14px; color: #333; }
         
         .station-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(90px, 1fr)); gap: 5px; }
-        .station-card { 
-            border: 1px solid #ddd; padding: 5px; font-size: 10px; text-align: center; background: #fff; border-radius: 3px; 
-            display: flex; flex-direction: column; justify-content: center;
-        }
+        .station-card { border: 1px solid #ddd; padding: 5px; font-size: 10px; text-align: center; background: #fff; border-radius: 3px; display: flex; flex-direction: column; justify-content: center; }
         .status-dot { display: inline-block; width: 8px; height: 8px; border-radius: 50%; margin-right: 3px; }
         .st-wave { font-size: 9px; color: #666; margin-top: 2px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
         .delay-badge { background: #dc3545; color: white; padding: 1px 3px; border-radius: 3px; font-size: 8px; font-weight: bold; }
@@ -139,7 +139,7 @@ def main():
 </head>
 <body>
     <div class="header">
-        <h3>🏭 倉儲戰情室 (Speed & Receiving Fixed)</h3>
+        <h3>🏭 倉儲戰情室 (Date Fix)</h3>
         <div style="flex:1"></div>
         <span id="timeDisplay" style="font-weight: bold;">--</span>
     </div>
@@ -172,17 +172,17 @@ def main():
                 </div>
                 
                 <div class="panel">
-                    <h4>🌊 波次進度</h4>
+                    <h4>🌊 波次進度 (Outbound)</h4>
                     <div id="wave-list">Wait...</div>
                 </div>
                 
                 <div class="panel">
-                    <h4>🚛 進貨進度</h4>
+                    <h4>🚛 進貨進度 (Inbound)</h4>
                     <div id="recv-list">Wait...</div>
                 </div>
                 
                 <div class="panel">
-                    <h4>📊 即時指標</h4>
+                    <h4>📊 統計</h4>
                     <div>Active AGV: <span id="val-active">0</span></div>
                     <div>Done Tasks: <span id="val-done">0</span></div>
                 </div>
@@ -248,7 +248,6 @@ def main():
         const ctx = obj.ctx;
         ctx.fillStyle = '#fafafa'; ctx.fillRect(0,0, ctx.canvas.width, ctx.canvas.height);
         if(!obj.map) return;
-
         for(let r=0; r<obj.rows; r++) {
             for(let c=0; c<obj.cols; c++) {
                 const val = obj.map[r][c];
@@ -264,14 +263,11 @@ def main():
                 else if(val==3) { ctx.fillStyle='#e0f7fa'; ctx.fillRect(x,y,s,s); } 
             }
         }
-        
         Object.keys(stState).forEach(sid => {
             const s = stState[sid];
             if(s.floor === floorName && s.x !== -1) {
                 const x=obj.ox+s.x*obj.size, y=obj.oy+s.y*obj.size, sz=obj.size;
-                ctx.fillStyle = s.color === 'BLUE' ? '#007bff' : 
-                                s.color === 'GREEN' ? '#28a745' : 
-                                s.color === 'ORANGE' ? '#fd7e14' : 'rgba(255,255,255,0.7)';
+                ctx.fillStyle = s.color === 'BLUE' ? '#007bff' : s.color === 'GREEN' ? '#28a745' : s.color === 'ORANGE' ? '#fd7e14' : 'rgba(255,255,255,0.7)';
                 ctx.fillRect(x+1, y+1, sz-2, sz-2);
                 ctx.fillStyle = 'black'; ctx.font = 'bold 8px Arial';
                 ctx.fillText(sid.replace('WS_',''), x+2, y+sz/1.5);
@@ -281,8 +277,9 @@ def main():
     }
 
     let currTime = __MIN_TIME__;
+    if(isNaN(currTime)) currTime = 0;
     let isPlaying = false;
-    let lastFrameTime = 0; // For real delta time
+    let lastFrameTime = 0;
 
     function updateState(time) {
         agvIds.forEach(id => {
@@ -301,11 +298,7 @@ def main():
                 agvState[id] = { floor: lastEvt[2], x: lastEvt[6], y: lastEvt[7], visible: true };
             }
         });
-
-        Object.keys(stState).forEach(sid => { 
-            stState[sid].status = 'IDLE'; stState[sid].color = 'WHITE'; stState[sid].wave = '-'; stState[sid].delay = false;
-        });
-        
+        Object.keys(stState).forEach(sid => { stState[sid].status = 'IDLE'; stState[sid].color = 'WHITE'; stState[sid].wave = '-'; stState[sid].delay = false; });
         for(let i=0; i<events.length; i++) {
             const e = events[i];
             if (e[8] === 'STATION_STATUS') {
@@ -314,15 +307,12 @@ def main():
                     const sid = e[3];
                     if(stState[sid]) {
                         const parts = e[9].split('|');
-                        const color = parts[0] || 'WHITE';
-                        const wid = parts[1] || '?';
-                        const isDelay = parts[2] === 'True' || parts[2] === 'Y';
-                        stState[sid].status = color === 'BLUE' ? 'OUT' : (color === 'GREEN' ? 'IN' : 'REP');
-                        stState[sid].color = color;
+                        stState[sid].status = parts[0] === 'BLUE' ? 'OUT' : (parts[0] === 'GREEN' ? 'IN' : 'REP');
+                        stState[sid].color = parts[0];
                         stState[sid].floor = e[2];
                         stState[sid].x = e[4]; stState[sid].y = e[5];
-                        stState[sid].wave = wid;
-                        stState[sid].delay = isDelay;
+                        stState[sid].wave = parts[1];
+                        stState[sid].delay = parts[2] === 'True' || parts[2] === 'Y';
                     }
                 }
             }
@@ -336,30 +326,24 @@ def main():
         
         let activeCount = 0;
         const occupancy = {};
-        
         Object.keys(agvState).forEach(id => {
             const s = agvState[id];
             if (!s.visible) return;
             const obj = s.floor == '2F' ? f2 : f3;
             if(!obj.map) return;
-            
-            const gx = Math.round(s.x);
-            const gy = Math.round(s.y);
+            const gx = Math.round(s.x), gy = Math.round(s.y);
             const key = `${s.floor}_${gx}_${gy}`;
             occupancy[key] = (occupancy[key] || 0) + 1;
             const count = occupancy[key];
-            
             let offX = 0, offY = 0;
             if (count > 1) {
                 const shift = obj.size * 0.3;
                 offX = ((count % 2) === 0 ? 1 : -1) * shift * (count/2);
                 offY = ((count % 2) !== 0 ? 1 : -1) * shift * (count/3);
             }
-
             const sz = obj.size;
             const px = obj.ox + s.x * sz + sz/2 + offX;
             const py = obj.oy + s.y * sz + sz/2 + offY;
-            
             obj.ctx.fillStyle = agvColors[id];
             obj.ctx.beginPath(); obj.ctx.arc(px, py, sz/2.2, 0, Math.PI*2); obj.ctx.fill();
             activeCount++;
@@ -371,11 +355,7 @@ def main():
             const s = stState[sid];
             const color = s.color === 'BLUE' ? '#007bff' : s.color === 'GREEN' ? '#28a745' : s.color==='ORANGE'?'#fd7e14':'#eee';
             const delayHtml = s.delay ? '<div class="delay-badge">DELAY</div>' : '';
-            const card = `<div class="station-card">
-                <div style="font-weight:bold;display:flex;justify-content:space-between;width:100%">${sid.replace('WS_','')} ${delayHtml}</div>
-                <div style="margin-top:2px"><span class="status-dot" style="background:${color}"></span>${s.status}</div>
-                <div class="st-wave" title="${s.wave}">${s.wave}</div>
-            </div>`;
+            const card = `<div class="station-card"><div style="font-weight:bold;display:flex;justify-content:space-between;width:100%">${sid.replace('WS_','')} ${delayHtml}</div><div style="margin-top:2px"><span class="status-dot" style="background:${color}"></span>${s.status}</div><div class="st-wave" title="${s.wave}">${s.wave}</div></div>`;
             if (s.floor === '2F') html2 += card; else html3 += card;
         });
         document.getElementById('st-list-2f').innerHTML = html2 || 'No Data';
@@ -386,9 +366,20 @@ def main():
         document.getElementById('timeDisplay').innerText = new Date(currTime*1000).toLocaleString();
         document.getElementById('slider').value = currTime;
         
-        // Active Waves
         const doneByWave = {};
-        doneTasks.filter(k=>k[1]=='PICKING').forEach(k=>{ doneByWave[k[2]]=(doneByWave[k[2]]||0)+1 });
+        const doneRecv = {}; // Key: Date
+        
+        doneTasks.forEach(k => {
+            const wid = k[2];
+            const type = k[1];
+            const date = k[4]; // YYYY-MM-DD
+            if(type === 'RECEIVING') {
+                doneRecv[date] = (doneRecv[date] || 0) + 1;
+            } else {
+                doneByWave[wid] = (doneByWave[wid] || 0) + 1;
+            }
+        });
+        
         let wHtml = '';
         Object.keys(waveInfo).sort().forEach(wid => {
             const info = waveInfo[wid];
@@ -396,32 +387,22 @@ def main():
             const total = info.total || 1;
             if(done > 0 && done <= total) {
                 const pct = (done/total*100).toFixed(0);
-                const delayedSoFar = doneTasks.filter(k => k[2] === wid && k[3] === 'Y').length;
-                const isDelayed = delayedSoFar > 0;
-                const barColor = isDelayed ? '#dc3545' : '#007bff';
-                const warn = isDelayed ? '<span class="warn-tag">DELAY</span>' : '';
-                wHtml += `<div class="wave-item">
-                    <div style="display:flex;justify-content:space-between"><span>${wid} ${warn}</span><span>${done}/${total}</span></div>
-                    <div class="progress-bg"><div class="progress-fill" style="width:${pct}%;background:${barColor}"></div></div>
-                </div>`;
+                const barColor = info.delayed ? '#dc3545' : '#007bff';
+                const warn = info.delayed ? '<span class="warn-tag">DELAY</span>' : '';
+                wHtml += `<div class="wave-item"><div style="display:flex;justify-content:space-between"><span>${wid} ${warn}</span><span>${done}/${total}</span></div><div class="progress-bg"><div class="progress-fill" style="width:${pct}%;background:${barColor}"></div></div></div>`;
             }
         });
         document.getElementById('wave-list').innerHTML = wHtml || '<div style="color:#999;padding:5px">Waiting...</div>';
         
-        // Receiving (Now reads from precomputed recvInfo)
         let rHtml = '';
         const todayStr = new Date(currTime*1000).toISOString().split('T')[0];
         
-        // Need to calculate Done for today's Receiving
-        const rDone = doneTasks.filter(k => k[4] === todayStr && k[1] == 'RECEIVING').length;
-        const rTotal = recvInfo[todayStr] ? recvInfo[todayStr].total : 0;
-        
-        if (rTotal > 0) {
-            const rPct = (rDone/rTotal*100).toFixed(0);
-            rHtml = `<div class="wave-item">
-                <div style="display:flex;justify-content:space-between"><span>📅 ${todayStr}</span><span>${rDone} / ${rTotal}</span></div>
-                <div class="progress-bg"><div class="progress-fill" style="width:${rPct}%;background:#28a745"></div></div>
-            </div>`;
+        // Show progress for today if data exists
+        if (recvInfo[todayStr]) {
+            const info = recvInfo[todayStr];
+            const done = doneRecv[todayStr] || 0;
+            const pct = info.total > 0 ? (done/info.total*100).toFixed(0) : 0;
+            rHtml = `<div class="wave-item"><div style="display:flex;justify-content:space-between"><span>📅 ${todayStr}</span><span>${done}/${info.total}</span></div><div class="progress-bg"><div class="progress-fill" style="width:${pct}%;background:#28a745"></div></div></div>`;
         } else {
             rHtml = '<div style="color:#999;padding:5px">No receiving orders today</div>';
         }
@@ -431,33 +412,25 @@ def main():
     function animate() {
         requestAnimationFrame(animate);
         if(!isPlaying) { lastFrameTime = performance.now(); return; }
-        
         const now = performance.now();
-        const dt = (now - lastFrameTime) / 1000; // seconds
+        const dt = (now - lastFrameTime) / 1000;
         lastFrameTime = now;
-        
         const speed = parseInt(document.getElementById('speed').value);
-        // Correct time progression: dt (real sec) * speed (sim sec / real sec)
         currTime += dt * speed; 
-        
         if(currTime > __MAX_TIME__) { currTime = __MIN_TIME__; isPlaying = false; }
         render();
     }
     
-    function togglePlay() { 
-        isPlaying=!isPlaying; 
-        if(isPlaying) lastFrameTime = performance.now(); 
-    }
+    function togglePlay() { isPlaying=!isPlaying; if(isPlaying) lastFrameTime = performance.now(); }
     document.getElementById('slider').addEventListener('input', e=>{ currTime=parseInt(e.target.value); render(); });
-    
     render();
 </script>
 </body>
 </html>
 """
+    # Serialize shelf data
     js_shelf_data = {'2F': [], '3F': []}
-    for f in shelf_data:
-        js_shelf_data[f] = [f"{c[0]},{c[1]}" for c in shelf_data[f]]
+    for f in shelf_data: js_shelf_data[f] = [f"{c[0]},{c[1]}" for c in shelf_data[f]]
 
     final_html = html_template.replace('__MAP2F__', json.dumps(map_2f)) \
                               .replace('__MAP3F__', json.dumps(map_3f)) \
