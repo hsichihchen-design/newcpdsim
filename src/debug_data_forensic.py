@@ -1,57 +1,53 @@
 import pandas as pd
+import numpy as np
 import os
 
 BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-LOG_DIR = os.path.join(BASE_DIR, 'logs')
-MAP_DIR = os.path.join(BASE_DIR, 'data', 'mapping')
+EVENTS_FILE = os.path.join(BASE_DIR, 'logs', 'simulation_events.csv')
 
-def forensic_analysis():
-    print("🕵️‍♂️ 啟動資料鑑識 (Data Forensic)...")
+def inspect_data():
+    print("🔍 [數據法醫] 開始檢查 simulation_events.csv...")
     
-    # 1. 檢查地圖座標檔 (Step 1 產出的)
-    shelf_map_path = os.path.join(MAP_DIR, 'shelf_coordinate_map.csv')
-    if os.path.exists(shelf_map_path):
-        print(f"\n1. 檢查座標映射表 ({os.path.basename(shelf_map_path)}):")
-        df_map = pd.read_csv(shelf_map_path)
-        print(f"   -> 總料架數: {len(df_map)}")
-        print(f"   -> 座標範例 (前 5 筆):")
-        print(df_map[['shelf_id', 'floor', 'x', 'y']].head(5).to_string(index=False))
-        
-        # 統計座標分佈
-        unique_x = df_map['x'].unique()
-        unique_y = df_map['y'].unique()
-        print(f"   -> X (Row?) 分佈範圍: {min(unique_x)} ~ {max(unique_x)} (共 {len(unique_x)} 種值)")
-        print(f"   -> Y (Col?) 分佈範圍: {min(unique_y)} ~ {max(unique_y)} (共 {len(unique_y)} 種值)")
-        
-        if len(unique_x) < 5 or len(unique_y) < 5:
-            print("   ⚠️ 警訊：座標值的變化太少！這代表所有料架可能都疊在一起。")
-    else:
-        print("   ❌ 找不到座標表，請重新執行 Step 1")
+    if not os.path.exists(EVENTS_FILE):
+        print("❌ 找不到檔案！請先跑 Step 4。")
+        return
 
-    # 2. 檢查事件 Log (Step 4 產出的)
-    events_path = os.path.join(LOG_DIR, 'simulation_events.csv')
-    if os.path.exists(events_path):
-        print(f"\n2. 檢查移動事件 ({os.path.basename(events_path)}):")
-        df_evt = pd.read_csv(events_path)
-        moves = df_evt[df_evt['type'] == 'AGV_MOVE']
+    df = pd.read_csv(EVENTS_FILE)
+    print(f"   -> 總筆數: {len(df)}")
+    
+    # 1. 檢查空值
+    null_times = df['start_time'].isnull().sum() + df['end_time'].isnull().sum()
+    if null_times > 0:
+        print(f"⚠️ 警告：發現 {null_times} 筆時間為空 (NaN) 的資料！這會導致前端崩潰。")
+    
+    # 2. 檢查時間範圍 (轉換測試)
+    # 使用 coerce 強制轉換，錯誤變成 NaT
+    df['start_dt'] = pd.to_datetime(df['start_time'], errors='coerce')
+    df['end_dt'] = pd.to_datetime(df['end_time'], errors='coerce')
+    
+    # 檢查 NaT (轉換失敗的日期)
+    nat_count = df['start_dt'].isna().sum()
+    if nat_count > 0:
+        print(f"⚠️ 警告：有 {nat_count} 筆日期格式錯誤，無法轉換！")
+        print("   -> 錯誤樣本:", df[df['start_dt'].isna()]['start_time'].head(3).values)
+
+    # 剔除 NaT 後檢查範圍
+    valid_df = df.dropna(subset=['start_dt', 'end_dt'])
+    
+    if not valid_df.empty:
+        min_t = valid_df['start_dt'].min()
+        max_t = valid_df['end_dt'].max()
+        print(f"   📅 有效時間範圍: {min_t} ~ {max_t}")
         
-        if moves.empty:
-            print("   ❌ 沒有任何移動事件！")
+        # 檢查是否有異常未來時間 (例如超過 7/2)
+        outliers = valid_df[valid_df['end_dt'] > pd.Timestamp('2025-07-02')]
+        if not outliers.empty:
+            print(f"❌ 發現 {len(outliers)} 筆異常的未來數據 (超過 7/2)！")
+            print("   -> 異常樣本:\n", outliers[['obj_id', 'start_time', 'end_time']].head(3))
         else:
-            print(f"   -> 總移動次數: {len(moves)}")
-            print("   -> 移動範例 (前 5 筆):")
-            print(moves[['floor', 'obj_id', 'sx', 'sy', 'ex', 'ey']].head(5).to_string(index=False))
-            
-            # 檢查是否真的有移動 (起點 != 終點)
-            static_moves = moves[(moves['sx'] == moves['ex']) & (moves['sy'] == moves['ey'])]
-            print(f"   -> 原地踏步的移動數: {len(static_moves)} (佔 {len(static_moves)/len(moves)*100:.1f}%)")
-            
-            if len(static_moves) > len(moves) * 0.9:
-                print("   ⚠️ 警訊：90% 以上的移動都是原地踏步！難怪車子看起來不動。")
-            else:
-                print("   ✅ 資料顯示車子確實有改變座標，問題出在視覺化縮放。")
+            print("✅ 時間範圍在正常的一天內。")
     else:
-        print("   ❌ 找不到事件 Log，請重新執行 Step 4")
+        print("❌ 嚴重錯誤：沒有任何有效時間數據！")
 
 if __name__ == "__main__":
-    forensic_analysis()
+    inspect_data()

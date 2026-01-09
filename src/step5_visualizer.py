@@ -1,6 +1,7 @@
 import pandas as pd
 import json
 import os
+import numpy as np
 
 BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 DATA_MAP_DIR = os.path.join(BASE_DIR, 'data', 'master')
@@ -39,107 +40,126 @@ def load_shelf_map():
     return shelf_set
 
 def main():
-    print("🚀 [Step 5] 啟動視覺化 (Fix Date Format & Sorting)...")
+    print("🚀 [Step 5] 啟動視覺化 (Debug Mode)...")
 
     map_2f = load_map_robust('2F_map.xlsx')
     map_3f = load_map_robust('3F_map.xlsx')
     shelf_data = load_shelf_map()
     
     events_path = os.path.join(LOG_DIR, 'simulation_events.csv')
-    if not os.path.exists(events_path): return
+    if not os.path.exists(events_path): 
+        print("❌ 找不到 simulation_events.csv")
+        return
+        
     df_events = pd.read_csv(events_path)
-    df_events['start_ts'] = pd.to_datetime(df_events['start_time'], format='mixed').astype('int64') // 10**9
-    df_events['end_ts'] = pd.to_datetime(df_events['end_time'], format='mixed').astype('int64') // 10**9
+    
+    # 1. 時間清洗
+    df_events['start_ts'] = pd.to_datetime(df_events['start_time'], errors='coerce')
+    df_events['end_ts'] = pd.to_datetime(df_events['end_time'], errors='coerce')
+    df_events = df_events.dropna(subset=['start_ts', 'end_ts'])
+    
+    # 過濾異常年份 (2024~2030)
+    df_events = df_events[
+        (df_events['start_ts'].dt.year >= 2024) & 
+        (df_events['end_ts'].dt.year <= 2030)
+    ]
+    
+    # 轉整數 Timestamp
+    df_events['start_ts'] = df_events['start_ts'].astype('int64') // 10**9
+    df_events['end_ts'] = df_events['end_ts'].astype('int64') // 10**9
     df_events = df_events.sort_values('start_ts')
     df_events['text'] = df_events['text'].fillna('').astype(str)
     
-    events_data = df_events[['start_ts', 'end_ts', 'floor', 'obj_id', 'sx', 'sy', 'ex', 'ey', 'type', 'text']].values.tolist()
-    min_time = df_events['start_ts'].min() if not df_events.empty else 0
-    max_time = df_events['end_ts'].max() if not df_events.empty else 1
-    
-    all_agvs = df_events[df_events['type']=='AGV_MOVE']['obj_id'].unique().tolist()
-    all_stations = df_events[df_events['obj_id'].str.startswith('WS_')]['obj_id'].unique().tolist()
+    if df_events.empty:
+        print("❌ 錯誤：時間過濾後無資料！")
+        # 產生一筆假資料避免前端崩潰
+        min_time = 1751328000
+        max_time = 1751414400
+        events_data = []
+    else:
+        min_time = int(df_events['start_ts'].min())
+        max_time = int(df_events['end_ts'].max())
+        events_data = df_events[['start_ts', 'end_ts', 'floor', 'obj_id', 'sx', 'sy', 'ex', 'ey', 'type', 'text']].values.tolist()
+
+    # [Fix] 防止時間軸長度為 0
+    if max_time <= min_time:
+        max_time = min_time + 3600
+        print("⚠️ 警告：時間軸過短，已強制延長 1 小時")
+
+    print(f"   📅 前端時間軸: {min_time} ~ {max_time} (Duration: {max_time-min_time}s)")
+
+    all_agvs = df_events[df_events['type']=='AGV_MOVE']['obj_id'].unique().tolist() if not df_events.empty else []
+    all_stations = df_events[df_events['obj_id'].str.startswith('WS_')]['obj_id'].unique().tolist() if not df_events.empty else []
     try: all_stations.sort(key=lambda x: int(x.split('_')[1]))
     except: pass
 
-    # KPI Analysis
+    # KPI
     kpi_path = os.path.join(LOG_DIR, 'simulation_kpi.csv')
     kpi_raw = []
-    wave_info = {} 
-    recv_info = {} 
-    try:
-        df_kpi = pd.read_csv(kpi_path)
-        df_kpi['finish_ts'] = pd.to_datetime(df_kpi['finish_time'], format='mixed').astype('int64') // 10**9
-        
-        # [Fix] 強制標準化日期格式 (YYYY-MM-DD)
-        df_kpi['date'] = pd.to_datetime(df_kpi['finish_time'], format='mixed').dt.strftime('%Y-%m-%d')
-        
-        if 'total_in_wave' not in df_kpi.columns: df_kpi['total_in_wave'] = 0
-        
-        # [Fix] 強制排序
-        df_kpi = df_kpi.sort_values('finish_ts')
-        
-        kpi_raw = df_kpi[['finish_ts', 'type', 'wave_id', 'is_delayed', 'date', 'workstation', 'total_in_wave']].values.tolist()
-        
-        for _, row in df_kpi.iterrows():
-            wid = str(row['wave_id'])
-            total = int(row['total_in_wave'])
+    wave_totals_simple = {}
+    recv_totals_simple = {}
+
+    if os.path.exists(kpi_path):
+        try:
+            df_kpi = pd.read_csv(kpi_path)
+            df_kpi['finish_ts'] = pd.to_datetime(df_kpi['finish_time'], errors='coerce')
+            df_kpi = df_kpi.dropna(subset=['finish_ts'])
+            df_kpi['date'] = df_kpi['finish_ts'].dt.strftime('%Y-%m-%d')
+            df_kpi['finish_ts'] = df_kpi['finish_ts'].astype('int64') // 10**9
+            df_kpi = df_kpi.sort_values('finish_ts')
             
-            if 'RECEIVING' in wid:
-                d = str(row['date'])
-                if d not in recv_info: recv_info[d] = {'total': 0, 'done': 0} # Init structure
-                if total > recv_info[d]['total']: recv_info[d]['total'] = total
-            else:
-                if wid not in wave_info: wave_info[wid] = {'total': total, 'delayed': 0}
-                if total > wave_info[wid]['total']: wave_info[wid]['total'] = total
-                if row['is_delayed'] == 'Y': wave_info[wid]['delayed'] += 1
-                
-    except Exception as e:
-        print(f"⚠️ KPI 讀取錯誤: {e}")
+            if 'total_in_wave' not in df_kpi.columns: df_kpi['total_in_wave'] = 0
+            
+            kpi_raw = df_kpi[['finish_ts', 'type', 'wave_id', 'is_delayed', 'date', 'workstation', 'total_in_wave']].values.tolist()
+            
+            for _, row in df_kpi.iterrows():
+                total = int(row['total_in_wave'])
+                if row['type'] == 'RECEIVING':
+                    d = row['date']
+                    if total > recv_totals_simple.get(d, 0): recv_totals_simple[d] = total
+                else:
+                    wid = str(row['wave_id'])
+                    if total > wave_totals_simple.get(wid, 0): wave_totals_simple[wid] = total
+        except Exception as e:
+            print(f"⚠️ KPI 讀取錯誤: {e}")
 
     html_template = """
 <!DOCTYPE html>
 <html>
 <head>
     <meta charset="utf-8">
-    <title>Warehouse Monitor V7 (Stable)</title>
+    <title>Warehouse Monitor (Debug)</title>
     <style>
         body { font-family: 'Segoe UI', sans-serif; margin: 0; display: flex; flex-direction: column; height: 100vh; overflow: hidden; background: #eef1f5; }
         .header { background: #fff; height: 40px; padding: 0 20px; display: flex; align-items: center; border-bottom: 1px solid #ddd; flex-shrink: 0; }
         .main { display: flex; flex: 1; overflow: hidden; }
-        
         .map-section { flex: 3; display: flex; flex-direction: column; padding: 10px; gap: 10px; overflow: hidden; }
         .floor-container { flex: 1; background: #fff; border: 1px solid #ccc; position: relative; display: flex; flex-direction: column; overflow: hidden; }
         .floor-label { position: absolute; top: 5px; left: 5px; background: rgba(255,255,255,0.9); padding: 2px 6px; font-weight: bold; font-size: 12px; z-index: 10; border: 1px solid #999; }
         .canvas-wrap { flex: 1; width: 100%; height: 100%; position: relative; }
         canvas { display: block; width: 100%; height: 100%; }
-        
         .dash-section { flex: 1; min-width: 400px; max-width: 500px; background: #fff; border-left: 1px solid #ccc; display: flex; flex-direction: column; }
         .dash-content { flex: 1; overflow-y: auto; padding: 10px; }
         .panel { margin-bottom: 10px; border: 1px solid #eee; padding: 8px; border-radius: 4px; background: #fafafa; }
         .panel h4 { margin: 0 0 8px 0; border-bottom: 2px solid #007bff; font-size: 14px; color: #333; }
-        
         .station-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(90px, 1fr)); gap: 5px; }
         .station-card { border: 1px solid #ddd; padding: 5px; font-size: 10px; text-align: center; background: #fff; border-radius: 3px; display: flex; flex-direction: column; justify-content: center; }
         .status-dot { display: inline-block; width: 8px; height: 8px; border-radius: 50%; margin-right: 3px; }
         .st-wave { font-size: 9px; color: #666; margin-top: 2px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
         .delay-badge { background: #dc3545; color: white; padding: 1px 3px; border-radius: 3px; font-size: 8px; font-weight: bold; }
-        
         .wave-item { font-size:11px; margin-bottom:5px; background:#fff; padding:5px; border:1px solid #ddd; }
         .progress-bg { height:6px; background:#eee; margin-top:2px; border-radius:3px; overflow:hidden; }
         .progress-fill { height:100%; transition:width 0.3s; }
         .warn-tag { color: white; background: #dc3545; padding: 1px 4px; border-radius: 3px; font-size: 9px; margin-left: 5px; }
-        
         .controls { padding: 10px; background: #fff; border-top: 1px solid #ddd; display: flex; gap: 10px; align-items: center; }
         .legend { display: flex; gap: 10px; font-size: 11px; margin-bottom: 5px; }
         .box { width: 12px; height: 12px; margin-right: 3px; border: 1px solid #666; }
-        
         .floor-title { font-size: 11px; font-weight: bold; margin: 5px 0 2px 0; color: #555; }
     </style>
 </head>
 <body>
     <div class="header">
-        <h3>🏭 倉儲戰情室 (Date Fix)</h3>
+        <h3>🏭 倉儲戰情室 (Debug Mode)</h3>
         <div style="flex:1"></div>
         <span id="timeDisplay" style="font-weight: bold;">--</span>
     </div>
@@ -170,17 +190,14 @@ def main():
                     <div class="floor-title" style="margin-top:10px">3F</div>
                     <div id="st-list-3f" class="station-grid">Wait...</div>
                 </div>
-                
                 <div class="panel">
                     <h4>🌊 波次進度 (Outbound)</h4>
                     <div id="wave-list">Wait...</div>
                 </div>
-                
                 <div class="panel">
                     <h4>🚛 進貨進度 (Inbound)</h4>
                     <div id="recv-list">Wait...</div>
                 </div>
-                
                 <div class="panel">
                     <h4>📊 統計</h4>
                     <div>Active AGV: <span id="val-active">0</span></div>
@@ -206,10 +223,31 @@ def main():
     const shelfData = __SHELF_DATA__; 
     const events = __EVENTS__;
     const kpiRaw = __KPI_RAW__;
-    const waveInfo = __WAVE_INFO__;
-    const recvInfo = __RECV_INFO__;
     const agvIds = __AGV_IDS__;
     const stIds = __STATION_IDS__;
+    const serverRecvTotals = __RECV_TOTALS__;
+    const serverWaveTotals = __WAVE_TOTALS__;
+    
+    let minTime = parseInt(__MIN_TIME__);
+    let maxTime = parseInt(__MAX_TIME__);
+    
+    // --- DEBUG BLOCK START ---
+    console.log("=== Debug Info ===");
+    console.log("Min Time:", minTime);
+    console.log("Max Time:", maxTime);
+    console.log("Events Count:", events.length);
+    console.log("AGVs:", agvIds.length);
+    console.log("Stations:", stIds.length);
+    
+    if (isNaN(minTime) || isNaN(maxTime)) {
+        alert("錯誤: 時間範圍是 NaN，請檢查 Python 生成邏輯");
+        minTime = 1700000000; maxTime = 1700003600;
+    }
+    if (maxTime <= minTime) {
+        console.warn("Max Time <= Min Time, adjusting...");
+        maxTime = minTime + 3600;
+    }
+    // --- DEBUG BLOCK END ---
 
     const shelfSets = { '2F': new Set(shelfData['2F']), '3F': new Set(shelfData['3F']) };
     const agvColors = {};
@@ -276,10 +314,14 @@ def main():
         });
     }
 
-    let currTime = __MIN_TIME__;
-    if(isNaN(currTime)) currTime = 0;
+    let currTime = minTime;
     let isPlaying = false;
     let lastFrameTime = 0;
+
+    const slider = document.getElementById('slider');
+    slider.min = minTime;
+    slider.max = maxTime;
+    slider.value = minTime;
 
     function updateState(time) {
         agvIds.forEach(id => {
@@ -319,6 +361,14 @@ def main():
         }
     }
 
+    function getLocalYMD(ts) {
+        const d = new Date(ts * 1000);
+        const y = d.getFullYear();
+        const m = String(d.getMonth()+1).padStart(2,'0');
+        const day = String(d.getDate()).padStart(2,'0');
+        return `${y}-${m}-${day}`;
+    }
+
     function render() {
         updateState(currTime);
         drawMap(f2, '2F');
@@ -353,7 +403,7 @@ def main():
         let html2 = '', html3 = '';
         stIds.forEach(sid => {
             const s = stState[sid];
-            const color = s.color === 'BLUE' ? '#007bff' : s.color === 'GREEN' ? '#28a745' : s.color==='ORANGE'?'#fd7e14':'#eee';
+            const color = s.color === 'BLUE' ? '#007bff' : s.color === 'GREEN' ? '#28a745' : s.color === 'ORANGE' ? '#fd7e14' : 'rgba(255,255,255,0.7)';
             const delayHtml = s.delay ? '<div class="delay-badge">DELAY</div>' : '';
             const card = `<div class="station-card"><div style="font-weight:bold;display:flex;justify-content:space-between;width:100%">${sid.replace('WS_','')} ${delayHtml}</div><div style="margin-top:2px"><span class="status-dot" style="background:${color}"></span>${s.status}</div><div class="st-wave" title="${s.wave}">${s.wave}</div></div>`;
             if (s.floor === '2F') html2 += card; else html3 += card;
@@ -367,12 +417,12 @@ def main():
         document.getElementById('slider').value = currTime;
         
         const doneByWave = {};
-        const doneRecv = {}; // Key: Date
+        const doneRecv = {}; 
         
         doneTasks.forEach(k => {
             const wid = k[2];
             const type = k[1];
-            const date = k[4]; // YYYY-MM-DD
+            const date = k[4]; 
             if(type === 'RECEIVING') {
                 doneRecv[date] = (doneRecv[date] || 0) + 1;
             } else {
@@ -380,12 +430,28 @@ def main():
             }
         });
         
+        const waveInfoLive = {}, recvInfoLive = {};
+        for(let d in serverRecvTotals) recvInfoLive[d] = {total: serverRecvTotals[d]};
+        for(let w in serverWaveTotals) waveInfoLive[w] = {total: serverWaveTotals[w], delayed: false};
+        
+        kpiRaw.forEach(k => {
+            const wid = k[2], type = k[1], date = k[4], total = k[6];
+            if(type === 'RECEIVING') {
+                if(!recvInfoLive[date]) recvInfoLive[date] = {total: 0};
+                if(total > recvInfoLive[date].total) recvInfoLive[date].total = total;
+            } else {
+                if(!waveInfoLive[wid]) waveInfoLive[wid] = {total: 0, delayed: false};
+                if(total > waveInfoLive[wid].total) waveInfoLive[wid].total = total;
+                if(k[3] === 'Y') waveInfoLive[wid].delayed = true;
+            }
+        });
+
         let wHtml = '';
-        Object.keys(waveInfo).sort().forEach(wid => {
-            const info = waveInfo[wid];
+        Object.keys(waveInfoLive).sort().forEach(wid => {
+            const info = waveInfoLive[wid];
             const done = doneByWave[wid] || 0;
             const total = info.total || 1;
-            if(done > 0 && done <= total) {
+            if(total > 0) {
                 const pct = (done/total*100).toFixed(0);
                 const barColor = info.delayed ? '#dc3545' : '#007bff';
                 const warn = info.delayed ? '<span class="warn-tag">DELAY</span>' : '';
@@ -395,16 +461,14 @@ def main():
         document.getElementById('wave-list').innerHTML = wHtml || '<div style="color:#999;padding:5px">Waiting...</div>';
         
         let rHtml = '';
-        const todayStr = new Date(currTime*1000).toISOString().split('T')[0];
-        
-        // Show progress for today if data exists
-        if (recvInfo[todayStr]) {
-            const info = recvInfo[todayStr];
+        const todayStr = getLocalYMD(currTime);
+        if (recvInfoLive[todayStr]) {
+            const info = recvInfoLive[todayStr];
             const done = doneRecv[todayStr] || 0;
             const pct = info.total > 0 ? (done/info.total*100).toFixed(0) : 0;
             rHtml = `<div class="wave-item"><div style="display:flex;justify-content:space-between"><span>📅 ${todayStr}</span><span>${done}/${info.total}</span></div><div class="progress-bg"><div class="progress-fill" style="width:${pct}%;background:#28a745"></div></div></div>`;
         } else {
-            rHtml = '<div style="color:#999;padding:5px">No receiving orders today</div>';
+            rHtml = `<div style="color:#999;padding:5px">No receiving orders on ${todayStr}</div>`;
         }
         document.getElementById('recv-list').innerHTML = rHtml;
     }
@@ -415,14 +479,36 @@ def main():
         const now = performance.now();
         const dt = (now - lastFrameTime) / 1000;
         lastFrameTime = now;
-        const speed = parseInt(document.getElementById('speed').value);
+        
+        let speed = parseInt(document.getElementById('speed').value);
+        if(isNaN(speed)) speed = 10;
+        
         currTime += dt * speed; 
-        if(currTime > __MAX_TIME__) { currTime = __MIN_TIME__; isPlaying = false; }
+        
+        if(isNaN(currTime)) { currTime = minTime; isPlaying = false; }
+        if(currTime > maxTime) { 
+            currTime = minTime; 
+            isPlaying = false; 
+            console.log("Animation End Reached");
+        }
         render();
     }
     
-    function togglePlay() { isPlaying=!isPlaying; if(isPlaying) lastFrameTime = performance.now(); }
-    document.getElementById('slider').addEventListener('input', e=>{ currTime=parseInt(e.target.value); render(); });
+    function togglePlay() { 
+        isPlaying=!isPlaying; 
+        if(isPlaying) {
+            lastFrameTime = performance.now(); 
+            console.log("Playing started at", currTime);
+        } else {
+            console.log("Paused");
+        }
+    }
+    document.getElementById('slider').addEventListener('input', e=>{ 
+        currTime=parseInt(e.target.value); 
+        console.log("Seek to", currTime);
+        render(); 
+    });
+    
     render();
 </script>
 </body>
@@ -437,16 +523,16 @@ def main():
                               .replace('__SHELF_DATA__', json.dumps(js_shelf_data)) \
                               .replace('__EVENTS__', json.dumps(events_data)) \
                               .replace('__KPI_RAW__', json.dumps(kpi_raw)) \
-                              .replace('__WAVE_INFO__', json.dumps(wave_info)) \
-                              .replace('__RECV_INFO__', json.dumps(recv_info)) \
                               .replace('__AGV_IDS__', json.dumps(all_agvs)) \
                               .replace('__STATION_IDS__', json.dumps(all_stations)) \
                               .replace('__MIN_TIME__', str(min_time)) \
-                              .replace('__MAX_TIME__', str(max_time))
+                              .replace('__MAX_TIME__', str(max_time)) \
+                              .replace('__RECV_TOTALS__', json.dumps(recv_totals_simple)) \
+                              .replace('__WAVE_TOTALS__', json.dumps(wave_totals_simple))
 
     with open(OUTPUT_HTML, 'w', encoding='utf-8') as f:
         f.write(final_html)
-    print(f"✅ 視覺化生成完畢: {OUTPUT_HTML}")
+    print(f"✅ 視覺化生成完畢 (Debug版): {OUTPUT_HTML}")
 
 if __name__ == "__main__":
     main()
