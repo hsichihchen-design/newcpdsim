@@ -11,13 +11,12 @@ DATA_MAP_DIR = os.path.join(BASE_DIR, 'data', 'master')
 DATA_TRX_DIR = os.path.join(BASE_DIR, 'data', 'transaction')
 
 # ==========================================
-# A* Pathfinding
+# A* Pathfinding (核心尋路演算法)
 # ==========================================
 def heuristic(a, b): return abs(a[0] - b[0]) + abs(a[1] - b[1])
 
 def find_path(grid, start, goal):
     rows, cols = grid.shape
-    # 邊界檢查
     if not (0 <= start[0] < rows and 0 <= start[1] < cols): return None
     if not (0 <= goal[0] < rows and 0 <= goal[1] < cols): return None
     
@@ -27,7 +26,6 @@ def find_path(grid, start, goal):
     g_score = {start: 0}
     f_score = {start: heuristic(start, goal)}
     
-    # 限制搜索步數，避免死路卡太久
     steps = 0
     max_steps = 5000 
 
@@ -58,7 +56,7 @@ def find_path(grid, start, goal):
     return None
 
 # ==========================================
-# Simulation Classes
+# Simulation Classes (物理實體)
 # ==========================================
 class TrafficManager:
     def __init__(self): self.occupied = {}
@@ -113,7 +111,7 @@ class AGV:
 
 class PhysicsSim:
     def __init__(self):
-        print("🚀 [Step 6] 物理模擬引擎啟動 (Fix: Timestamp vs String)...")
+        print("🚀 [Step 6] 物理模擬引擎啟動 (Strict Sort Mode)...")
         self.tm = TrafficManager()
         self.w2 = self._load_grid('2F_map.xlsx')
         self.w3 = self._load_grid('3F_map.xlsx')
@@ -156,19 +154,27 @@ class PhysicsSim:
             try: df = pd.read_csv(p, encoding='utf-8-sig')
             except: df = pd.read_csv(p, encoding='cp950')
             
-            # [修正] 確保 datetime 正確轉換
-            df['datetime'] = pd.to_datetime(df['datetime'])
+            # [關鍵修正] 強制重新構建 datetime 並排序
+            # 有時候 CSV 存檔後順序會亂，或者格式被誤判
+            if 'DATE' in df.columns and 'TIME' in df.columns:
+                df['datetime'] = pd.to_datetime(df['DATE'].astype(str) + ' ' + df['TIME'].astype(str))
+            else:
+                df['datetime'] = pd.to_datetime(df['datetime'])
             
-            # [修正] 關鍵點：同時將 WAVE_DEADLINE 轉為 datetime 物件
+            # 這裡進行嚴格排序！
+            df = df.sort_values('datetime', ascending=True).reset_index(drop=True)
+            
             if 'WAVE_DEADLINE' in df.columns:
                 df['WAVE_DEADLINE'] = pd.to_datetime(df['WAVE_DEADLINE'], errors='coerce')
                 
-            return df.sort_values('datetime').to_dict('records')
+            print(f"📦 訂單載入完成: {len(df)} 筆")
+            print(f"   📅 時間範圍: {df['datetime'].min()} ~ {df['datetime'].max()}")
+            return df.to_dict('records')
         except Exception as e: 
             print(f"❌ 讀取訂單失敗: {e}")
             return []
 
-    def run(self, max_ticks=864000): # 修改預設值為 10 天
+    def run(self, max_ticks=86400): # 預設跑 24 小時 (1天)
         # Setup Logs
         f_evt = open(os.path.join(LOG_DIR, 'simulation_events.csv'), 'w', newline='', encoding='utf-8')
         w_evt = csv.writer(f_evt)
@@ -186,12 +192,16 @@ class PhysicsSim:
         oidx = 0
         completed_count = 0
         
-        print(f"🎬 開始模擬 10 天 (目標 Ticks: {max_ticks})...")
-        print(f"   起始時間: {sim_time}")
+        print(f"🎬 開始模擬... (起始時間: {sim_time})")
         
         for tick in range(max_ticks):
             sim_time += timedelta(seconds=1)
             
+            # [心跳包] 每 10 分鐘寫入一筆，確保 Visualizer 時間軸能撐開
+            if tick % 600 == 0 and self.agvs:
+                a0 = self.agvs[0]
+                w_evt.writerow([sim_time, sim_time, a0.floor, f"AGV_{a0.id}", a0.pos[1], a0.pos[0], a0.pos[1], a0.pos[0], 'HEARTBEAT', ''])
+
             # 1. Dispatch Orders
             while oidx < len(self.orders) and self.orders[oidx]['datetime'] <= sim_time:
                 ord_data = self.orders[oidx]
@@ -231,14 +241,8 @@ class PhysicsSim:
                 elif status == 'DONE':
                     completed_count += 1
                     task = res
-                    
-                    # [修正] 這裡比較 Timestamp vs Timestamp，不會再報錯了
                     deadline = task.get('WAVE_DEADLINE')
-                    
-                    # 防呆: 如果沒有 deadline 或是 NaT，就給一個寬限期
-                    if pd.isna(deadline):
-                        deadline = sim_time + timedelta(hours=1)
-                        
+                    if pd.isna(deadline): deadline = sim_time + timedelta(hours=1)
                     is_delayed = 'Y' if sim_time > deadline else 'N'
                     
                     w_kpi.writerow([
@@ -255,5 +259,6 @@ class PhysicsSim:
         print(f"\n✅ 模擬結束！共完成 {completed_count} 張訂單")
 
 if __name__ == "__main__":
-    # 執行模擬：10 天 = 86400 * 10 = 864000 秒
+    # 如果要跑 24 小時，請設 86400
+    # 如果要跑 10 天，請設 864000
     PhysicsSim().run(max_ticks=86400)
