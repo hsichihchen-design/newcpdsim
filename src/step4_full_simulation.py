@@ -23,7 +23,6 @@ class TimeAwareAStar:
 
     def find_path(self, start, goal, start_time_sec):
         if start == goal: return [(start, start_time_sec)], start_time_sec
-        # 邊界檢查
         if not (0 <= start[0] < self.rows and 0 <= start[1] < self.cols): return None, None
         if not (0 <= goal[0] < self.rows and 0 <= goal[1] < self.cols): return None, None
 
@@ -31,7 +30,6 @@ class TimeAwareAStar:
         heapq.heappush(open_set, (0, 0, start, start_time_sec))
         came_from = {}
         g_score = {(start, start_time_sec): 0}
-        
         max_steps = 3000 
         steps = 0
         NORMAL_COST = 1      
@@ -57,13 +55,11 @@ class TimeAwareAStar:
             for dr, dc in self.moves:
                 nr, nc = current[0] + dr, current[1] + dc
                 next_time = current_time + NORMAL_COST 
-                
                 if 0 <= nr < self.rows and 0 <= nc < self.cols:
                     val = self.grid[nr][nc]
                     step_cost = NORMAL_COST
                     if (val == 1 or val == 2):
                         if (nr, nc) != goal and (nr, nc) != start: step_cost = RELOCATION_COST
-
                     if (nr, nc, next_time) in self.reservations: continue
                     new_g = g_score[(current, current_time)] + step_cost
                     next_node_key = ((nr, nc), next_time)
@@ -77,19 +73,19 @@ class TimeAwareAStar:
 
 class AdvancedSimulationRunner:
     def __init__(self):
-        print(f"🚀 [Step 4] 啟動進階模擬 (True Random Spread)...")
+        print(f"🚀 [Step 4] 啟動進階模擬 (Receiving Fix + Random Spread)...")
         
         self.PICK_TIME = 20
         self.grid_2f = self._load_map('2F_map.xlsx')
         self.grid_3f = self._load_map('3F_map.xlsx')
-        
         self.reservations_2f = set()
         self.reservations_3f = set()
         self.shelf_coords = self._load_shelf_coords()
         self.inventory_map = self._load_inventory()
-        self.orders = self._load_orders()
         
-        # AGV 初始化: 使用全圖隨機撒點，解決集中左上角問題
+        # [Fix] 載入出貨與進貨單
+        self.orders = self._load_all_tasks()
+        
         print("   -> 初始化車隊: 2F(18台), 3F(18台)")
         self.agv_state = {
             '2F': {i: {'time': 0, 'pos': self._get_truly_random_spot(self.grid_2f)} for i in range(1, 19)},
@@ -98,23 +94,24 @@ class AdvancedSimulationRunner:
         self.stations = self._init_stations()
         
         self.wave_totals = {}
+        self.recv_totals = {}
         for o in self.orders:
             wid = o.get('WAVE_ID', 'UNKNOWN')
-            self.wave_totals[wid] = self.wave_totals.get(wid, 0) + 1
+            # 區分波次與進貨
+            if 'RECEIVING' in wid:
+                d = o['datetime'].strftime('%Y-%m-%d')
+                self.recv_totals[d] = self.recv_totals.get(d, 0) + 1
+            else:
+                self.wave_totals[wid] = self.wave_totals.get(wid, 0) + 1
 
     def _get_truly_random_spot(self, grid):
-        """找出所有空地 (0)，然後隨機選一個，確保分散"""
         rows, cols = grid.shape
         candidates = []
-        # 掃描全圖 (這只在初始化跑一次，不影響效能)
         for r in range(rows):
             for c in range(cols):
-                if grid[r][c] == 0:
-                    candidates.append((r, c))
-        
-        if candidates:
-            return random.choice(candidates)
-        return (0, 0) # Fallback
+                if grid[r][c] == 0: candidates.append((r, c))
+        if candidates: return random.choice(candidates)
+        return (0, 0)
 
     def _find_nearest_empty_spot(self, grid, start_pos):
         rows, cols = grid.shape
@@ -144,7 +141,7 @@ class AdvancedSimulationRunner:
                 except: pass
         if df is not None:
             grid = df.fillna(0).values
-            grid[grid == -1] = 1 # 牆壁標準化
+            grid[grid == -1] = 1
             return grid
         return np.zeros((10,10))
 
@@ -172,15 +169,46 @@ class AdvancedSimulationRunner:
         except: pass
         return inv
 
-    def _load_orders(self):
-        path = os.path.join(BASE_DIR, 'data', 'transaction', 'wave_orders.csv')
+    def _load_all_tasks(self):
+        """讀取並合併 出貨單(Wave) 與 進貨單(Receiving)"""
+        tasks = []
+        
+        # 1. 讀取出貨單
+        path_out = os.path.join(BASE_DIR, 'data', 'transaction', 'wave_orders.csv')
         try:
-            df = pd.read_csv(path)
-            df['datetime'] = pd.to_datetime(df['datetime'])
-            if 'WAVE_DEADLINE' in df.columns:
-                df['WAVE_DEADLINE'] = pd.to_datetime(df['WAVE_DEADLINE'], errors='coerce')
-            return df.sort_values('datetime').to_dict('records')
-        except: return []
+            df_out = pd.read_csv(path_out)
+            df_out['datetime'] = pd.to_datetime(df_out['datetime'])
+            if 'WAVE_DEADLINE' in df_out.columns:
+                df_out['WAVE_DEADLINE'] = pd.to_datetime(df_out['WAVE_DEADLINE'], errors='coerce')
+            tasks.extend(df_out.to_dict('records'))
+        except: pass
+        
+        # 2. 讀取進貨單 (Fixed)
+        path_in = os.path.join(BASE_DIR, 'data', 'transaction', 'historical_receiving_ex.csv')
+        try:
+            df_in = pd.read_csv(path_in)
+            # 轉換欄位名稱以符合模擬器需求
+            # 假設欄位有 RECEIVING_DATE, ITEM_NO
+            cols = df_in.columns
+            date_col = next((c for c in cols if 'DATE' in c), None)
+            part_col = next((c for c in cols if 'ITEM' in c or 'PART' in c), None)
+            
+            if date_col and part_col:
+                df_in['datetime'] = pd.to_datetime(df_in[date_col]) + timedelta(hours=9) # 假設早上9點進貨
+                df_in['PARTNO'] = df_in[part_col]
+                df_in['WAVE_ID'] = 'RECEIVING_' + df_in['datetime'].dt.strftime('%Y%m%d')
+                df_in['WAVE_DEADLINE'] = pd.NaT # 進貨沒有嚴格 Deadline
+                
+                tasks.extend(df_in.to_dict('records'))
+                print(f"   -> 成功載入進貨單: {len(df_in)} 筆")
+            else:
+                print("   ⚠️ 進貨單欄位不符 (需有 DATE 和 ITEM/PART)")
+        except Exception as e: 
+            print(f"   ⚠️ 進貨單讀取失敗: {e}")
+
+        # 排序
+        tasks.sort(key=lambda x: x['datetime'])
+        return tasks
 
     def _init_stations(self):
         sts = {}
@@ -202,9 +230,10 @@ class AdvancedSimulationRunner:
         candidates = self.inventory_map.get(part, [])
         valid_targets = []
         for sid in candidates:
-            if sid in self.shelf_coords:
-                valid_targets.append(self.shelf_coords[sid])
-
+            if sid in self.shelf_coords: valid_targets.append(self.shelf_coords[sid])
+        
+        # 進貨單沒有庫存? 隨機找個空位放? 
+        # 這裡簡化: 假設進貨也是去既有的料架位置 (補貨)
         if not valid_targets and self.shelf_coords:
             sid = random.choice(list(self.shelf_coords.keys()))
             valid_targets.append(self.shelf_coords[sid])
@@ -217,9 +246,7 @@ class AdvancedSimulationRunner:
             f = tgt['floor']
             st_pos = st_ref_2f if f == '2F' else st_ref_3f
             dist = abs(tgt['pos'][0] - st_pos[0]) + abs(tgt['pos'][1] - st_pos[1])
-            if dist < min_dist:
-                min_dist = dist
-                best_tgt = tgt
+            if dist < min_dist: min_dist = dist; best_tgt = tgt
         return best_tgt
 
     def write_move_events(self, writer, path, floor, agv_id, res_table):
@@ -269,17 +296,13 @@ class AdvancedSimulationRunner:
             for sid, info in self.stations.items():
                 if info['floor'] == floor: return info['pos']
             return (0,0)
-            
         st_ref_2f = find_first_st('2F')
         st_ref_3f = find_first_st('3F')
 
         for order in self.orders:
             order_start_sec = to_sec(order['datetime'])
             target = self.get_best_target(order, st_ref_2f, st_ref_3f)
-            
-            if not target:
-                count += 1
-                continue
+            if not target: count += 1; continue
             
             floor = target['floor']
             shelf_pos = target['pos']
@@ -300,16 +323,17 @@ class AdvancedSimulationRunner:
             astar = astar_2f if floor == '2F' else astar_3f
             res_table = self.reservations_2f if floor == '2F' else self.reservations_3f
             
+            # 1. Move to Station
             path_to_station, arrive_st_sec = astar.find_path(agv_curr_pos, st_pos, start_sec)
             if not path_to_station:
                 arrive_st_sec = start_sec + 60
                 path_to_station = [(agv_curr_pos, start_sec), (st_pos, arrive_st_sec)]
             self.write_move_events(w_evt, path_to_station, floor, best_agv, res_table)
 
+            # 2. To Shelf
             path_to_shelf, arrive_shelf_sec = astar.find_path(st_pos, shelf_pos, arrive_st_sec)
             if not path_to_shelf:
-                total_dur = 300 
-                finish_sec = arrive_st_sec + total_dur
+                finish_sec = arrive_st_sec + 300
                 pick_end_sec = finish_sec - 100
                 drop_pos = shelf_pos
             else:
@@ -319,12 +343,14 @@ class AdvancedSimulationRunner:
                     self.to_dt(arrive_shelf_sec), self.to_dt(pick_end_sec), floor, f"AGV_{best_agv}",
                     shelf_pos[1], shelf_pos[0], shelf_pos[1], shelf_pos[0], 'PICKING', f"Order_{count}"
                 ])
+                # 3. Return
                 path_return, finish_sec = astar.find_path(shelf_pos, st_pos, pick_end_sec)
                 if path_return:
                     self.write_move_events(w_evt, path_return, floor, best_agv, res_table)
                 else:
                     finish_sec = pick_end_sec + 60
-                    
+                
+                # 4. Dropoff
                 grid_obj = self.grid_2f if floor == '2F' else self.grid_3f
                 drop_pos = self._find_nearest_empty_spot(grid_obj, st_pos)
                 path_drop, drop_sec = astar.find_path(st_pos, drop_pos, finish_sec)
@@ -332,6 +358,7 @@ class AdvancedSimulationRunner:
                      self.write_move_events(w_evt, path_drop, floor, best_agv, res_table)
                      finish_sec = drop_sec
 
+            # Station Status
             task_type = 'OUTBOUND'
             wave_id = str(order.get('WAVE_ID', 'UNKNOWN'))
             if 'RECEIVING' in wave_id: task_type = 'INBOUND'
@@ -356,9 +383,16 @@ class AdvancedSimulationRunner:
             self.agv_state[floor][best_agv]['pos'] = drop_pos
             self.stations[best_st]['free_time'] = finish_sec
             
-            total_in_wave = self.wave_totals.get(wave_id, 0)
+            # KPI: 如果是進貨單，total_in_wave 使用當日進貨總量
+            total_in_wave = 0
+            if task_type == 'INBOUND':
+                d_str = order['datetime'].strftime('%Y-%m-%d')
+                total_in_wave = self.recv_totals.get(d_str, 0)
+            else:
+                total_in_wave = self.wave_totals.get(wave_id, 0)
+                
             w_kpi.writerow([
-                self.to_dt(finish_sec), 'PICKING', wave_id,
+                self.to_dt(finish_sec), 'PICKING' if task_type=='OUTBOUND' else 'RECEIVING', wave_id,
                 is_delayed, self.to_dt(finish_sec).date(), f"WS_{best_st}", total_in_wave
             ])
             
