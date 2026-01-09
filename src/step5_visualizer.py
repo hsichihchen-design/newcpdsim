@@ -40,7 +40,7 @@ def load_shelf_map():
     return shelf_set
 
 def main():
-    print("🚀 [Step 5] 啟動視覺化 (V13: Active Delay Tracking)...")
+    print("🚀 [Step 5] 啟動視覺化 (V14: Variable Fix)...")
 
     map_2f = load_map_robust('2F_map.xlsx')
     map_3f = load_map_robust('3F_map.xlsx')
@@ -83,7 +83,7 @@ def main():
     kpi_path = os.path.join(LOG_DIR, 'simulation_kpi.csv')
     kpi_raw = []
     
-    wave_deadlines = {} # {wid: timestamp}
+    wave_deadlines = {} 
     wave_totals_simple = {} 
     recv_totals_simple = {} 
 
@@ -98,7 +98,6 @@ def main():
         if 'total_in_wave' not in df_kpi.columns: df_kpi['total_in_wave'] = 0
         if 'deadline_ts' not in df_kpi.columns: df_kpi['deadline_ts'] = 0
         
-        # 傳遞 deadline_ts (Index 7)
         kpi_raw = df_kpi[['finish_ts', 'type', 'wave_id', 'is_delayed', 'date', 'workstation', 'total_in_wave', 'deadline_ts']].values.tolist()
         
         for _, row in df_kpi.iterrows():
@@ -122,7 +121,7 @@ def main():
 <html>
 <head>
     <meta charset="utf-8">
-    <title>Warehouse Monitor V13</title>
+    <title>Warehouse Monitor V14</title>
     <style>
         body { font-family: 'Segoe UI', sans-serif; margin: 0; display: flex; flex-direction: column; height: 100vh; overflow: hidden; background: #eef1f5; }
         .header { background: #fff; height: 40px; padding: 0 20px; display: flex; align-items: center; border-bottom: 1px solid #ddd; flex-shrink: 0; }
@@ -155,7 +154,7 @@ def main():
 </head>
 <body>
     <div class="header">
-        <h3>🏭 倉儲戰情室 (V13)</h3>
+        <h3>🏭 倉儲戰情室 (V14)</h3>
         <div style="flex:1"></div>
         <span id="timeDisplay" style="font-weight: bold;">--</span>
     </div>
@@ -226,7 +225,6 @@ def main():
     const agvIds = __AGV_IDS__;
     const stIds = __STATION_IDS__;
     
-    // Inject Data
     const serverRecvTotals = __RECV_TOTALS__;
     const serverWaveTotals = __WAVE_TOTALS__;
     const serverWaveDeadlines = __WAVE_DEADLINES__;
@@ -325,7 +323,6 @@ def main():
                 const p = (time - activeEvt[0]) / (activeEvt[1] - activeEvt[0]);
                 agvState[id] = { floor: activeEvt[2], x: activeEvt[4]+(activeEvt[6]-activeEvt[4])*p, y: activeEvt[5]+(activeEvt[7]-activeEvt[5])*p, visible: true };
             } else if (lastEvt) {
-                // Keep showing AGV at last known position
                 agvState[id] = { floor: lastEvt[2], x: lastEvt[6], y: lastEvt[7], visible: true };
             }
         });
@@ -369,7 +366,6 @@ def main():
             if (!s.visible) return;
             const obj = s.floor == '2F' ? f2 : f3;
             if(!obj.map) return;
-            const gx = Math.round(s.x), gy = Math.round(s.y);
             const sz = obj.size;
             const px = obj.ox + s.x * sz + sz/2;
             const py = obj.oy + s.y * sz + sz/2;
@@ -395,12 +391,11 @@ def main():
         document.getElementById('timeDisplay').innerText = new Date(currTime*1000).toLocaleString();
         document.getElementById('slider').value = currTime;
         
-        const doneByWave = {};
-        const doneRecv = {}; 
-        
-        // Counters
+        // Stats
         let delayIn = 0;
         let delayOut = 0;
+        const doneRecv = {};
+        const doneByWave = {};
 
         doneTasks.forEach(k => {
             const wid = k[2], type = k[1], isD = k[3], date = k[4];
@@ -432,53 +427,33 @@ def main():
         });
 
         let wHtml = '';
-        const todayStr = getLocalYMD(currTime);
-        const todayDate = new Date(todayStr); // For comparison
-
         Object.keys(waveInfoLive).sort().forEach(wid => {
             const info = waveInfoLive[wid];
             const done = doneByWave[wid] || 0;
             const total = info.total || 1;
             
-            // Logic: Eliminate if (Done && Previous Day)
-            // We assume wave ID implies date or we just check if it's done.
-            // Simplified: If done==total AND it seems old (not perfect but OK) -> Hide
-            // Better: Just show active + today's done.
-            
             // Get Deadline & Delay Status
             const deadline = serverWaveDeadlines[wid] || 0;
             const isLateNow = (deadline > 0 && currTime > deadline && done < total);
             
-            // Calc Delay Text
             let delayTxt = '';
             if (isLateNow) {
                 const diffMins = Math.floor((currTime - deadline) / 60);
                 delayTxt = `<span class="warn-text">Delay ${diffMins}m</span>`;
             }
             
-            // Only show if not fully completed in past
             if (total > 0) {
                 const isDone = done >= total;
-                // Ideally check wave date, but let's just keep it simple: Show all unless done?
-                // Request: "After day pass, if done, remove".
-                // We'll show all for now to be safe, but mark delays clearly.
-                
                 const pct = (done/total*100).toFixed(0);
                 const barColor = isLateNow ? '#dc3545' : (isDone ? '#28a745' : '#007bff');
                 const warn = isLateNow ? '<span class="warn-tag">DELAY</span>' : '';
-                
-                wHtml += `<div class="wave-item">
-                    <div style="display:flex;justify-content:space-between">
-                        <span>${wid} ${warn} ${delayTxt}</span>
-                        <span>${done}/${total}</span>
-                    </div>
-                    <div class="progress-bg"><div class="progress-fill" style="width:${pct}%;background:${barColor}"></div></div>
-                </div>`;
+                wHtml += `<div class="wave-item"><div style="display:flex;justify-content:space-between"><span>${wid} ${warn} ${delayTxt}</span><span>${done}/${total}</span></div><div class="progress-bg"><div class="progress-fill" style="width:${pct}%;background:${barColor}"></div></div></div>`;
             }
         });
         document.getElementById('wave-list').innerHTML = wHtml || '<div style="color:#999;padding:5px">Waiting...</div>';
         
         let rHtml = '';
+        const todayStr = getLocalYMD(currTime);
         if (recvInfoLive[todayStr]) {
             const info = recvInfoLive[todayStr];
             const done = doneRecv[todayStr] || 0;
@@ -508,7 +483,6 @@ def main():
     function togglePlay() { isPlaying=!isPlaying; if(isPlaying) lastFrameTime = performance.now(); }
     document.getElementById('slider').addEventListener('input', e=>{ currTime=parseInt(e.target.value); render(); });
     
-    // Auto-Start
     animate();
     
 </script>
@@ -516,7 +490,6 @@ def main():
 </html>
 """
     
-    # Serialize shelf data
     js_shelf_data = {'2F': [], '3F': []}
     for f in shelf_data: js_shelf_data[f] = [f"{c[0]},{c[1]}" for c in shelf_data[f]]
 
@@ -525,8 +498,6 @@ def main():
                               .replace('__SHELF_DATA__', json.dumps(js_shelf_data)) \
                               .replace('__EVENTS__', json.dumps(events_data)) \
                               .replace('__KPI_RAW__', json.dumps(kpi_raw)) \
-                              .replace('__WAVE_INFO__', json.dumps(wave_info)) \
-                              .replace('__RECV_INFO__', json.dumps(recv_info)) \
                               .replace('__AGV_IDS__', json.dumps(all_agvs)) \
                               .replace('__STATION_IDS__', json.dumps(all_stations)) \
                               .replace('__MIN_TIME__', str(min_time)) \
