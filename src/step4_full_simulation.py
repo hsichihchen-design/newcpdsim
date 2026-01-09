@@ -73,7 +73,7 @@ class TimeAwareAStar:
 
 class AdvancedSimulationRunner:
     def __init__(self):
-        print(f"🚀 [Step 4] 啟動進階模擬 (Receiving Fix + Random Spread)...")
+        print(f"🚀 [Step 4] 啟動進階模擬 (Fix NaN Error)...")
         
         self.PICK_TIME = 20
         self.grid_2f = self._load_map('2F_map.xlsx')
@@ -83,7 +83,7 @@ class AdvancedSimulationRunner:
         self.shelf_coords = self._load_shelf_coords()
         self.inventory_map = self._load_inventory()
         
-        # [Fix] 載入出貨與進貨單
+        # 載入所有任務
         self.orders = self._load_all_tasks()
         
         print("   -> 初始化車隊: 2F(18台), 3F(18台)")
@@ -95,9 +95,11 @@ class AdvancedSimulationRunner:
         
         self.wave_totals = {}
         self.recv_totals = {}
+        
+        # [Fix] 這裡加入 str() 轉型，防止 NaN 導致錯誤
         for o in self.orders:
-            wid = o.get('WAVE_ID', 'UNKNOWN')
-            # 區分波次與進貨
+            wid = str(o.get('WAVE_ID', 'UNKNOWN')) 
+            
             if 'RECEIVING' in wid:
                 d = o['datetime'].strftime('%Y-%m-%d')
                 self.recv_totals[d] = self.recv_totals.get(d, 0) + 1
@@ -170,10 +172,7 @@ class AdvancedSimulationRunner:
         return inv
 
     def _load_all_tasks(self):
-        """讀取並合併 出貨單(Wave) 與 進貨單(Receiving)"""
         tasks = []
-        
-        # 1. 讀取出貨單
         path_out = os.path.join(BASE_DIR, 'data', 'transaction', 'wave_orders.csv')
         try:
             df_out = pd.read_csv(path_out)
@@ -183,30 +182,22 @@ class AdvancedSimulationRunner:
             tasks.extend(df_out.to_dict('records'))
         except: pass
         
-        # 2. 讀取進貨單 (Fixed)
         path_in = os.path.join(BASE_DIR, 'data', 'transaction', 'historical_receiving_ex.csv')
         try:
             df_in = pd.read_csv(path_in)
-            # 轉換欄位名稱以符合模擬器需求
-            # 假設欄位有 RECEIVING_DATE, ITEM_NO
             cols = df_in.columns
             date_col = next((c for c in cols if 'DATE' in c), None)
             part_col = next((c for c in cols if 'ITEM' in c or 'PART' in c), None)
             
             if date_col and part_col:
-                df_in['datetime'] = pd.to_datetime(df_in[date_col]) + timedelta(hours=9) # 假設早上9點進貨
+                df_in['datetime'] = pd.to_datetime(df_in[date_col]) + timedelta(hours=9)
                 df_in['PARTNO'] = df_in[part_col]
                 df_in['WAVE_ID'] = 'RECEIVING_' + df_in['datetime'].dt.strftime('%Y%m%d')
-                df_in['WAVE_DEADLINE'] = pd.NaT # 進貨沒有嚴格 Deadline
-                
+                df_in['WAVE_DEADLINE'] = pd.NaT 
                 tasks.extend(df_in.to_dict('records'))
                 print(f"   -> 成功載入進貨單: {len(df_in)} 筆")
-            else:
-                print("   ⚠️ 進貨單欄位不符 (需有 DATE 和 ITEM/PART)")
-        except Exception as e: 
-            print(f"   ⚠️ 進貨單讀取失敗: {e}")
+        except: pass
 
-        # 排序
         tasks.sort(key=lambda x: x['datetime'])
         return tasks
 
@@ -232,8 +223,6 @@ class AdvancedSimulationRunner:
         for sid in candidates:
             if sid in self.shelf_coords: valid_targets.append(self.shelf_coords[sid])
         
-        # 進貨單沒有庫存? 隨機找個空位放? 
-        # 這裡簡化: 假設進貨也是去既有的料架位置 (補貨)
         if not valid_targets and self.shelf_coords:
             sid = random.choice(list(self.shelf_coords.keys()))
             valid_targets.append(self.shelf_coords[sid])
@@ -323,14 +312,12 @@ class AdvancedSimulationRunner:
             astar = astar_2f if floor == '2F' else astar_3f
             res_table = self.reservations_2f if floor == '2F' else self.reservations_3f
             
-            # 1. Move to Station
             path_to_station, arrive_st_sec = astar.find_path(agv_curr_pos, st_pos, start_sec)
             if not path_to_station:
                 arrive_st_sec = start_sec + 60
                 path_to_station = [(agv_curr_pos, start_sec), (st_pos, arrive_st_sec)]
             self.write_move_events(w_evt, path_to_station, floor, best_agv, res_table)
 
-            # 2. To Shelf
             path_to_shelf, arrive_shelf_sec = astar.find_path(st_pos, shelf_pos, arrive_st_sec)
             if not path_to_shelf:
                 finish_sec = arrive_st_sec + 300
@@ -343,14 +330,12 @@ class AdvancedSimulationRunner:
                     self.to_dt(arrive_shelf_sec), self.to_dt(pick_end_sec), floor, f"AGV_{best_agv}",
                     shelf_pos[1], shelf_pos[0], shelf_pos[1], shelf_pos[0], 'PICKING', f"Order_{count}"
                 ])
-                # 3. Return
                 path_return, finish_sec = astar.find_path(shelf_pos, st_pos, pick_end_sec)
                 if path_return:
                     self.write_move_events(w_evt, path_return, floor, best_agv, res_table)
                 else:
                     finish_sec = pick_end_sec + 60
                 
-                # 4. Dropoff
                 grid_obj = self.grid_2f if floor == '2F' else self.grid_3f
                 drop_pos = self._find_nearest_empty_spot(grid_obj, st_pos)
                 path_drop, drop_sec = astar.find_path(st_pos, drop_pos, finish_sec)
@@ -358,7 +343,6 @@ class AdvancedSimulationRunner:
                      self.write_move_events(w_evt, path_drop, floor, best_agv, res_table)
                      finish_sec = drop_sec
 
-            # Station Status
             task_type = 'OUTBOUND'
             wave_id = str(order.get('WAVE_ID', 'UNKNOWN'))
             if 'RECEIVING' in wave_id: task_type = 'INBOUND'
@@ -383,7 +367,6 @@ class AdvancedSimulationRunner:
             self.agv_state[floor][best_agv]['pos'] = drop_pos
             self.stations[best_st]['free_time'] = finish_sec
             
-            # KPI: 如果是進貨單，total_in_wave 使用當日進貨總量
             total_in_wave = 0
             if task_type == 'INBOUND':
                 d_str = order['datetime'].strftime('%Y-%m-%d')
