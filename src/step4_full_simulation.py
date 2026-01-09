@@ -4,6 +4,7 @@ import os
 import time
 import heapq
 import csv
+import random
 from datetime import datetime, timedelta
 
 BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -22,29 +23,24 @@ class TimeAwareAStar:
 
     def find_path(self, start, goal, start_time_sec):
         if start == goal: return [(start, start_time_sec)], start_time_sec
-
         # 邊界檢查
         if not (0 <= start[0] < self.rows and 0 <= start[1] < self.cols): return None, None
         if not (0 <= goal[0] < self.rows and 0 <= goal[1] < self.cols): return None, None
 
         open_set = []
         heapq.heappush(open_set, (0, 0, start, start_time_sec))
-        
         came_from = {}
         g_score = {(start, start_time_sec): 0}
         
         max_steps = 3000 
         steps = 0
-        
-        # 移動成本設定
         NORMAL_COST = 1      
-        RELOCATION_COST = 45 # 移庫懲罰
+        RELOCATION_COST = 45 
         HEURISTIC_WEIGHT = 1.5 
 
         while open_set:
             steps += 1
             if steps > max_steps: return None, None
-
             _, _, current, current_time = heapq.heappop(open_set)
 
             if current == goal:
@@ -64,20 +60,13 @@ class TimeAwareAStar:
                 
                 if 0 <= nr < self.rows and 0 <= nc < self.cols:
                     val = self.grid[nr][nc]
-                    
                     step_cost = NORMAL_COST
                     if (val == 1 or val == 2):
-                        if (nr, nc) == goal or (nr, nc) == start:
-                            pass
-                        else:
-                            step_cost = RELOCATION_COST
+                        if (nr, nc) != goal and (nr, nc) != start: step_cost = RELOCATION_COST
 
-                    if (nr, nc, next_time) in self.reservations:
-                        continue
-                        
+                    if (nr, nc, next_time) in self.reservations: continue
                     new_g = g_score[(current, current_time)] + step_cost
                     next_node_key = ((nr, nc), next_time)
-                    
                     if next_node_key not in g_score or new_g < g_score[next_node_key]:
                         g_score[next_node_key] = new_g
                         h = self.heuristic((nr, nc), goal)
@@ -88,7 +77,7 @@ class TimeAwareAStar:
 
 class AdvancedSimulationRunner:
     def __init__(self):
-        print(f"🚀 [Step 4] 啟動進階模擬 (Fix: KeyError + 36 AGVs)...")
+        print(f"🚀 [Step 4] 啟動進階模擬 (True Random Spread)...")
         
         self.PICK_TIME = 20
         self.grid_2f = self._load_map('2F_map.xlsx')
@@ -100,22 +89,47 @@ class AdvancedSimulationRunner:
         self.inventory_map = self._load_inventory()
         self.orders = self._load_orders()
         
-        # [需求變更] AGV 數量提升至 74 台 (每樓 37 台)
-        # 2F: ID 1 ~ 18
-        # 3F: ID 101 ~ 118
-        print("   -> 初始化車隊: 2F(37台), 3F(37台)")
+        # AGV 初始化: 使用全圖隨機撒點，解決集中左上角問題
+        print("   -> 初始化車隊: 2F(18台), 3F(18台)")
         self.agv_state = {
-            '2F': {i: {'time': 0, 'pos': self._find_random_empty_spot(self.grid_2f)} for i in range(1, 38)},
-            '3F': {i: {'time': 0, 'pos': self._find_random_empty_spot(self.grid_3f)} for i in range(101, 138)}
+            '2F': {i: {'time': 0, 'pos': self._get_truly_random_spot(self.grid_2f)} for i in range(1, 19)},
+            '3F': {i: {'time': 0, 'pos': self._get_truly_random_spot(self.grid_3f)} for i in range(101, 119)}
         }
         self.stations = self._init_stations()
+        
+        self.wave_totals = {}
+        for o in self.orders:
+            wid = o.get('WAVE_ID', 'UNKNOWN')
+            self.wave_totals[wid] = self.wave_totals.get(wid, 0) + 1
 
-    def _find_random_empty_spot(self, grid):
+    def _get_truly_random_spot(self, grid):
+        """找出所有空地 (0)，然後隨機選一個，確保分散"""
         rows, cols = grid.shape
-        for _ in range(50):
-            r, c = np.random.randint(0, rows), np.random.randint(0, cols)
-            if grid[r][c] == 0: return (r, c)
-        return (0, 0)
+        candidates = []
+        # 掃描全圖 (這只在初始化跑一次，不影響效能)
+        for r in range(rows):
+            for c in range(cols):
+                if grid[r][c] == 0:
+                    candidates.append((r, c))
+        
+        if candidates:
+            return random.choice(candidates)
+        return (0, 0) # Fallback
+
+    def _find_nearest_empty_spot(self, grid, start_pos):
+        rows, cols = grid.shape
+        queue = [start_pos]
+        visited = set([start_pos])
+        while queue:
+            curr = queue.pop(0)
+            if grid[curr[0]][curr[1]] == 0: return curr
+            for dr, dc in [(0, 1), (0, -1), (1, 0), (-1, 0)]:
+                nr, nc = curr[0] + dr, curr[1] + dc
+                if 0 <= nr < rows and 0 <= nc < cols and (nr, nc) not in visited:
+                    if grid[nr][nc] != 2:
+                        visited.add((nr, nc))
+                        queue.append((nr, nc))
+        return start_pos
 
     def _load_map(self, filename):
         path = os.path.join(BASE_DIR, 'data', 'master', filename)
@@ -128,10 +142,9 @@ class AdvancedSimulationRunner:
             if os.path.exists(csv_path):
                 try: df = pd.read_csv(csv_path, header=None)
                 except: pass
-        
         if df is not None:
             grid = df.fillna(0).values
-            grid[grid == -1] = 1
+            grid[grid == -1] = 1 # 牆壁標準化
             return grid
         return np.zeros((10,10))
 
@@ -176,7 +189,6 @@ class AdvancedSimulationRunner:
             for c in range(self.grid_2f.shape[1]):
                 if self.grid_2f[r][c] == 2:
                     count += 1; sts[count] = {'floor': '2F', 'pos': (r,c), 'free_time': 0}
-        
         start_3f = count
         for r in range(self.grid_3f.shape[0]):
             for c in range(self.grid_3f.shape[1]):
@@ -185,43 +197,29 @@ class AdvancedSimulationRunner:
         if not sts: sts[1] = {'floor': '2F', 'pos': (5,5), 'free_time': 0}
         return sts
 
-    def get_best_target(self, order, default_st_pos_2f, default_st_pos_3f):
-        """
-        找出最佳料架。
-        修改邏輯：先不依賴特定樓層的 A*，而是先找出距離各樓層工作站最近的候選點。
-        """
+    def get_best_target(self, order, st_ref_2f, st_ref_3f):
         part = str(order.get('PARTNO', '')).strip()
         candidates = self.inventory_map.get(part, [])
-        
         valid_targets = []
         for sid in candidates:
             if sid in self.shelf_coords:
-                info = self.shelf_coords[sid]
-                valid_targets.append(info)
+                valid_targets.append(self.shelf_coords[sid])
 
         if not valid_targets and self.shelf_coords:
-            import random
             sid = random.choice(list(self.shelf_coords.keys()))
             valid_targets.append(self.shelf_coords[sid])
 
         if not valid_targets: return None
 
-        # 這裡做一個簡單的優化：
-        # 計算每個候選點到 "該樓層預設工作站" 的曼哈頓距離，選最近的
         best_tgt = None
         min_dist = float('inf')
-        
         for tgt in valid_targets:
             f = tgt['floor']
-            st_pos = default_st_pos_2f if f == '2F' else default_st_pos_3f
-            
-            # 曼哈頓距離 (不考慮障礙，只求快速篩選)
+            st_pos = st_ref_2f if f == '2F' else st_ref_3f
             dist = abs(tgt['pos'][0] - st_pos[0]) + abs(tgt['pos'][1] - st_pos[1])
-            
             if dist < min_dist:
                 min_dist = dist
                 best_tgt = tgt
-        
         return best_tgt
 
     def write_move_events(self, writer, path, floor, agv_id, res_table):
@@ -260,15 +258,13 @@ class AdvancedSimulationRunner:
         w_evt.writerow(['start_time', 'end_time', 'floor', 'obj_id', 'sx', 'sy', 'ex', 'ey', 'type', 'text'])
         f_kpi = open(os.path.join(LOG_DIR, 'simulation_kpi.csv'), 'w', newline='', encoding='utf-8')
         w_kpi = csv.writer(f_kpi)
-        w_kpi.writerow(['finish_time', 'type', 'wave_id', 'is_delayed', 'date', 'workstation'])
+        w_kpi.writerow(['finish_time', 'type', 'wave_id', 'is_delayed', 'date', 'workstation', 'total_in_wave'])
 
         count = 0
         total_orders = len(self.orders)
         print(f"🎬 開始模擬 {total_orders} 筆訂單...")
         start_real = time.time()
         
-        # 預先抓兩個樓層的參考工作站位置 (用於快速距離估算)
-        # 假設 2F 找 ID 1, 3F 找 ID 101 (或第一個找到的)
         def find_first_st(floor):
             for sid, info in self.stations.items():
                 if info['floor'] == floor: return info['pos']
@@ -279,8 +275,6 @@ class AdvancedSimulationRunner:
 
         for order in self.orders:
             order_start_sec = to_sec(order['datetime'])
-            
-            # [Fix Logic] 1. 先決定目標 (確定樓層)
             target = self.get_best_target(order, st_ref_2f, st_ref_3f)
             
             if not target:
@@ -289,15 +283,11 @@ class AdvancedSimulationRunner:
             
             floor = target['floor']
             shelf_pos = target['pos']
-            
-            # [Fix Logic] 2. 確定樓層後，再選該樓層的 AGV
             agv_pool = self.agv_state[floor]
-            # 這裡一定找得到，因為 agv_state 已經根據 floor 分好類了
             best_agv = min(agv_pool, key=lambda k: agv_pool[k]['time'])
             agv_ready_sec = agv_pool[best_agv]['time']
             agv_curr_pos = agv_pool[best_agv]['pos']
             
-            # 選擇同樓層的工作站
             valid_st = [sid for sid, info in self.stations.items() if info['floor'] == floor]
             if not valid_st: valid_st = list(self.stations.keys())
             st_pool = {sid: self.stations[sid]['free_time'] for sid in valid_st}
@@ -310,40 +300,40 @@ class AdvancedSimulationRunner:
             astar = astar_2f if floor == '2F' else astar_3f
             res_table = self.reservations_2f if floor == '2F' else self.reservations_3f
             
-            # 3. 移車 (Deadhead)
             path_to_station, arrive_st_sec = astar.find_path(agv_curr_pos, st_pos, start_sec)
             if not path_to_station:
                 arrive_st_sec = start_sec + 60
                 path_to_station = [(agv_curr_pos, start_sec), (st_pos, arrive_st_sec)]
             self.write_move_events(w_evt, path_to_station, floor, best_agv, res_table)
 
-            # 4. 去程 (Station -> Shelf)
             path_to_shelf, arrive_shelf_sec = astar.find_path(st_pos, shelf_pos, arrive_st_sec)
-            
             if not path_to_shelf:
                 total_dur = 300 
                 finish_sec = arrive_st_sec + total_dur
                 pick_end_sec = finish_sec - 100
+                drop_pos = shelf_pos
             else:
                 self.write_move_events(w_evt, path_to_shelf, floor, best_agv, res_table)
-                
                 pick_end_sec = arrive_shelf_sec + self.PICK_TIME
                 w_evt.writerow([
                     self.to_dt(arrive_shelf_sec), self.to_dt(pick_end_sec), floor, f"AGV_{best_agv}",
-                    shelf_pos[1], shelf_pos[0], shelf_pos[1], shelf_pos[0],
-                    'PICKING', f"Order_{count}"
+                    shelf_pos[1], shelf_pos[0], shelf_pos[1], shelf_pos[0], 'PICKING', f"Order_{count}"
                 ])
-                
-                # 5. 回程
                 path_return, finish_sec = astar.find_path(shelf_pos, st_pos, pick_end_sec)
                 if path_return:
                     self.write_move_events(w_evt, path_return, floor, best_agv, res_table)
                 else:
                     finish_sec = pick_end_sec + 60
+                    
+                grid_obj = self.grid_2f if floor == '2F' else self.grid_3f
+                drop_pos = self._find_nearest_empty_spot(grid_obj, st_pos)
+                path_drop, drop_sec = astar.find_path(st_pos, drop_pos, finish_sec)
+                if path_drop:
+                     self.write_move_events(w_evt, path_drop, floor, best_agv, res_table)
+                     finish_sec = drop_sec
 
-            # 6. 狀態更新
             task_type = 'OUTBOUND'
-            wave_id = str(order.get('WAVE_ID', ''))
+            wave_id = str(order.get('WAVE_ID', 'UNKNOWN'))
             if 'RECEIVING' in wave_id: task_type = 'INBOUND'
             elif 'REPLENISH' in wave_id: task_type = 'REPLENISH'
             
@@ -351,30 +341,30 @@ class AdvancedSimulationRunner:
             if task_type == 'INBOUND': status_color = 'GREEN'
             if task_type == 'REPLENISH': status_color = 'ORANGE'
             
-            w_evt.writerow([
-                self.to_dt(arrive_st_sec), self.to_dt(finish_sec), floor, f"WS_{best_st}",
-                st_pos[1], st_pos[0], st_pos[1], st_pos[0],
-                'STATION_STATUS', status_color
-            ])
-
-            self.agv_state[floor][best_agv]['time'] = finish_sec
-            self.agv_state[floor][best_agv]['pos'] = st_pos
-            self.stations[best_st]['free_time'] = finish_sec
-            
             is_delayed = 'N'
             deadline = order.get('WAVE_DEADLINE')
             if pd.notna(deadline) and isinstance(deadline, (pd.Timestamp, datetime)):
                  if self.to_dt(finish_sec) > deadline: is_delayed = 'Y'
+            
+            status_text = f"{status_color}|{wave_id}|{is_delayed}"
+            w_evt.writerow([
+                self.to_dt(arrive_st_sec), self.to_dt(finish_sec), floor, f"WS_{best_st}",
+                st_pos[1], st_pos[0], st_pos[1], st_pos[0], 'STATION_STATUS', status_text
+            ])
 
+            self.agv_state[floor][best_agv]['time'] = finish_sec
+            self.agv_state[floor][best_agv]['pos'] = drop_pos
+            self.stations[best_st]['free_time'] = finish_sec
+            
+            total_in_wave = self.wave_totals.get(wave_id, 0)
             w_kpi.writerow([
                 self.to_dt(finish_sec), 'PICKING', wave_id,
-                is_delayed, self.to_dt(finish_sec).date(), f"WS_{best_st}"
+                is_delayed, self.to_dt(finish_sec).date(), f"WS_{best_st}", total_in_wave
             ])
             
             count += 1
-            if count % 200 == 0:
+            if count % 500 == 0:
                 print(f"\r🚀 進度: {count}/{total_orders} (Time: {time.time()-start_real:.1f}s)", end='')
-                
                 limit_t = start_sec - 1800 
                 if floor == '2F':
                     self.reservations_2f = {r for r in self.reservations_2f if r[2] > limit_t}
