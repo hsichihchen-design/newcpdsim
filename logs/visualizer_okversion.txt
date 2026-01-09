@@ -1,0 +1,341 @@
+import pandas as pd
+import json
+import os
+import sys
+
+BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+DATA_MAP_DIR = os.path.join(BASE_DIR, 'data', 'master')
+LOG_DIR = os.path.join(BASE_DIR, 'logs')
+OUTPUT_HTML = os.path.join(LOG_DIR, 'dashboard_report.html')
+
+def load_map_robust(filename):
+    base_name = os.path.splitext(filename)[0]
+    path = os.path.join(DATA_MAP_DIR, filename)
+    if os.path.exists(path):
+        try: return pd.read_excel(path, header=None).fillna(0).values.tolist()
+        except: pass
+    csv_path = os.path.join(DATA_MAP_DIR, base_name + ".csv")
+    if os.path.exists(csv_path):
+        try: return pd.read_csv(csv_path, header=None).fillna(0).values.tolist()
+        except: pass
+    return []
+
+def main():
+    print("🚀 [Step 5] 啟動視覺化 (Syntax Fix & Date Fix)...")
+
+    # 1. 讀取地圖
+    map_2f = load_map_robust('2F_map.xlsx')
+    map_3f = load_map_robust('3F_map.xlsx')
+    
+    # 2. 讀取事件
+    events_path = os.path.join(LOG_DIR, 'simulation_events.csv')
+    if not os.path.exists(events_path): 
+        print("❌ 找不到 simulation_events.csv，請先執行 Step 4")
+        return
+        
+    df_events = pd.read_csv(events_path)
+    df_events['start_ts'] = pd.to_datetime(df_events['start_time'], format='mixed').astype('int64') // 10**9
+    df_events['end_ts'] = pd.to_datetime(df_events['end_time'], format='mixed').astype('int64') // 10**9
+    
+    # 過濾無效座標
+    valid_mask = (df_events['sx'] >= 1) & (df_events['sy'] >= 1) & (df_events['ex'] >= 1) & (df_events['ey'] >= 1)
+    valid_mask = valid_mask | (df_events['type'] == 'STATION_BUSY')
+    df_events = df_events[valid_mask]
+
+    if df_events.empty:
+        print("⚠️ 警告: 事件檔為空，請檢查 Step 4 是否有產出資料")
+        return
+
+    min_time = df_events['start_ts'].min()
+    max_time = df_events['end_ts'].max()
+    events_data = df_events[['start_ts', 'end_ts', 'floor', 'obj_id', 'sx', 'sy', 'ex', 'ey', 'type', 'text']].fillna('').values.tolist()
+
+    # 3. 讀取 KPI
+    kpi_path = os.path.join(LOG_DIR, 'simulation_kpi.csv')
+    df_kpi = pd.read_csv(kpi_path)
+    df_kpi['finish_ts'] = pd.to_datetime(df_kpi['finish_time'], format='mixed').astype('int64') // 10**9
+    
+    # [修正點 1] 確保 date 欄位在 kpi_raw 建立前就產生
+    df_kpi['date'] = pd.to_datetime(df_kpi['finish_time'], format='mixed').dt.date.astype(str)
+
+    # 預計算波次統計
+    wave_stats = {}
+    picking_rows = df_kpi[df_kpi['type'] == 'PICKING']
+    for _, row in picking_rows.iterrows():
+        wid = row['wave_id']
+        if wid not in wave_stats: wave_stats[wid] = {'total': 0, 'delayed': 0}
+        wave_stats[wid]['total'] += 1
+        if row['is_delayed'] == 'Y': wave_stats[wid]['delayed'] += 1
+    
+    # Daily Receiving Totals
+    recv_totals = df_kpi[df_kpi['type'] == 'RECEIVING'].groupby('date').size().to_dict()
+
+    # JS Data Payload
+    kpi_raw = df_kpi[['finish_ts', 'type', 'wave_id', 'is_delayed', 'date']].values.tolist()
+
+    html_content = f"""
+<!DOCTYPE html>
+<html>
+<head>
+    <meta charset="utf-8">
+    <title>Warehouse Monitor</title>
+    <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+    <style>
+        body {{ font-family: 'Segoe UI', sans-serif; background: #eef1f5; margin: 0; display: flex; flex-direction: column; height: 100vh; }}
+        .header {{ background: #fff; padding: 0 20px; height: 50px; display: flex; align-items: center; border-bottom: 1px solid #ddd; flex-shrink: 0; }}
+        
+        .main {{ display: flex; flex: 1; overflow: hidden; }}
+        
+        .map-section {{ flex: 2; display: flex; flex-direction: column; padding: 10px; gap: 10px; overflow-y: auto; }}
+        .floor-wrapper {{ background: #fff; border: 1px solid #ccc; border-radius: 4px; padding: 5px; position: relative; }}
+        .floor-label {{ position: absolute; top: 5px; left: 5px; background: rgba(255,255,255,0.9); padding: 2px 6px; font-weight: bold; font-size: 12px; z-index: 5; border: 1px solid #999; }}
+        canvas {{ display: block; margin: 0 auto; }}
+        
+        .kpi-section {{ flex: 1; background: #fff; border-left: 1px solid #ccc; display: flex; flex-direction: column; max-width: 420px; min-width: 350px; }}
+        .kpi-content {{ flex: 1; overflow-y: auto; padding: 15px; }}
+        
+        .panel-block {{ margin-bottom: 15px; border: 1px solid #e0e0e0; padding: 10px; border-radius: 6px; background: #fafafa; }}
+        .panel-title {{ font-size: 14px; font-weight: bold; margin-bottom: 10px; color: #444; border-bottom: 2px solid #007bff; display: inline-block; }}
+        
+        .wave-item {{ margin-bottom: 8px; padding: 5px; background: #fff; border: 1px solid #eee; border-radius: 4px; }}
+        .wave-item.delayed {{ border-left: 4px solid #dc3545; }}
+        .wave-header {{ display: flex; justify-content: space-between; font-size: 13px; margin-bottom: 4px; }}
+        .progress {{ height: 8px; background: #e9ecef; border-radius: 4px; overflow: hidden; }}
+        .progress-bar {{ height: 100%; transition: width 0.3s; }}
+        
+        .recv-row {{ display: flex; justify-content: space-between; font-size: 14px; margin-top: 5px; }}
+        .ws-grid {{ display: grid; grid-template-columns: repeat(auto-fill, minmax(60px, 1fr)); gap: 5px; }}
+        .ws-box {{ background: #fff; border: 1px solid #ddd; padding: 4px; text-align: center; border-radius: 3px; font-size: 11px; }}
+        .ws-box.busy {{ background: #ffebeb; border-color: #ffcccc; color: #dc3545; font-weight: bold; }}
+        
+        .controls {{ display: flex; gap: 10px; align-items: center; padding: 10px; background: #fff; border-top: 1px solid #ddd; }}
+    </style>
+</head>
+<body>
+    <div class="header">
+        <h3>📦 倉儲模擬監控 (Final)</h3>
+        <div style="flex:1"></div>
+        <span id="timeDisplay" style="font-family: monospace; font-weight: bold;">--</span>
+    </div>
+
+    <div class="main">
+        <div class="map-section">
+            <div class="floor-wrapper">
+                <div class="floor-label">2F Operation</div>
+                <canvas id="c2"></canvas>
+            </div>
+            <div class="floor-wrapper">
+                <div class="floor-label">3F Operation</div>
+                <canvas id="c3"></canvas>
+            </div>
+        </div>
+
+        <div class="kpi-section">
+            <div class="kpi-content">
+                
+                <div class="panel-block">
+                    <div class="panel-title">🌊 波次進度 (Active & Issues)</div>
+                    <div id="wave-list">等待資料...</div>
+                </div>
+
+                <div class="panel-block">
+                    <div class="panel-title">🚛 當日進貨 (Receiving)</div>
+                    <div class="recv-row"><span>目標/完成</span> <span id="recv-txt">0 / 0</span></div>
+                    <div class="progress" style="margin-top:5px"><div id="recv-bar" class="progress-bar" style="background:#17a2b8; width:0%"></div></div>
+                    <div class="recv-row"><span style="font-size:12px;color:#666">剩餘積壓</span> <span id="recv-backlog" style="color:#dc3545;font-weight:bold">0</span></div>
+                </div>
+
+                <div class="panel-block">
+                    <div class="panel-title">🏭 2F 工作站</div>
+                    <div id="ws-2f" class="ws-grid"></div>
+                </div>
+                <div class="panel-block">
+                    <div class="panel-title">🏭 3F 工作站</div>
+                    <div id="ws-3f" class="ws-grid"></div>
+                </div>
+            </div>
+            
+            <div class="controls">
+                <button onclick="togglePlay()" id="playBtn" style="padding:5px 15px; cursor:pointer;">Play</button>
+                <input type="range" id="slider" style="flex:1" min="{min_time}" max="{max_time}" value="{min_time}">
+                <select id="speed">
+                    <option value="60">1 min/s</option>
+                    <option value="600" selected>10 min/s</option>
+                    <option value="3600">1 hr/s</option>
+                    <option value="21600">6 hr/s</option>
+                </select>
+            </div>
+        </div>
+    </div>
+
+<script>
+    const map2F = {json.dumps(map_2f)};
+    const map3F = {json.dumps(map_3f)};
+    const events = {json.dumps(events_data)};
+    const kpiRaw = {json.dumps(kpi_raw)}; 
+    const waveStats = {json.dumps(wave_stats)};
+    const recvTotals = {json.dumps(recv_totals)};
+
+    function setupCanvas(id, mapData) {{
+        const c = document.getElementById(id);
+        const ctx = c.getContext('2d');
+        const rows = mapData.length || 10;
+        const cols = mapData[0]?.length || 10;
+        const containerW = c.parentElement.clientWidth - 20; 
+        const cellSize = Math.floor(containerW / cols);
+        c.width = cols * cellSize;
+        c.height = rows * cellSize;
+        return {{ c, ctx, rows, cols, size: cellSize, map: mapData }};
+    }}
+
+    let f2 = setupCanvas('c2', map2F);
+    let f3 = setupCanvas('c3', map3F);
+
+    window.onresize = () => {{
+        f2 = setupCanvas('c2', map2F);
+        f3 = setupCanvas('c3', map3F);
+        render();
+    }};
+
+    function initWS() {{
+        const w2 = document.getElementById('ws-2f');
+        const w3 = document.getElementById('ws-3f');
+        let h2='', h3='';
+        for(let i=1; i<=8; i++) h2 += `<div id="ws-box-${{i}}" class="ws-box">WS_${{i}}</div>`;
+        for(let i=101; i<=108; i++) h3 += `<div id="ws-box-${{i}}" class="ws-box">WS_${{i}}</div>`;
+        w2.innerHTML = h2; w3.innerHTML = h3;
+    }}
+    initWS();
+
+    function drawMap(obj) {{
+        const ctx = obj.ctx;
+        ctx.fillStyle = '#f9f9f9'; ctx.fillRect(0,0, obj.c.width, obj.c.height);
+        for(let r=0; r<obj.rows; r++) {{
+            for(let c=0; c<obj.cols; c++) {{
+                const val = obj.map[r][c];
+                const x=c*obj.size, y=r*obj.size, s=obj.size; 
+                if(val==1) {{ ctx.fillStyle='#bbb'; ctx.fillRect(x,y,s-1,s-1); }}
+                else if(val==2) {{ ctx.strokeStyle='#999'; ctx.strokeRect(x+1,y+1,s-2,s-2); }}
+                else if(val==3) {{ ctx.fillStyle='#dceefb'; ctx.fillRect(x,y,s-1,s-1); }}
+            }}
+        }}
+    }}
+
+    let currTime = {min_time};
+    let isPlaying = false;
+    let animId;
+
+    function render() {{
+        drawMap(f2); drawMap(f3);
+        
+        const activeEvts = events.filter(e => currTime >= e[0] && currTime <= e[1]);
+        const activeWS = {{}};
+        
+        activeEvts.forEach(e => {{
+            const obj = e[2]=='2F' ? f2 : f3;
+            const s = obj.size;
+            const ctx = obj.ctx;
+            
+            if(e[8] == 'AGV_MOVE') {{
+                const p = (currTime - e[0])/(e[1]-e[0]);
+                const cx = e[4] + (e[6]-e[4])*p; 
+                const cy = e[5] + (e[7]-e[5])*p; 
+                ctx.fillStyle = '#28a745';
+                ctx.beginPath(); ctx.arc(cx*s+s/2, cy*s+s/2, s/2.5, 0, Math.PI*2); ctx.fill();
+            }} else if(e[8] == 'STATION_BUSY') {{
+                const x=e[4]*s, y=e[5]*s;
+                ctx.fillStyle = 'rgba(220,53,69,0.5)';
+                ctx.fillRect(x,y,s,s);
+                activeWS[e[3]] = true; 
+            }}
+        }});
+        
+        for(let i=1; i<=8; i++) {{
+            const el = document.getElementById('ws-box-'+i);
+            if(activeWS['WS_'+i]) el.classList.add('busy'); else el.classList.remove('busy');
+        }}
+        for(let i=101; i<=108; i++) {{
+            const el = document.getElementById('ws-box-'+i);
+            if(activeWS['WS_'+i]) el.classList.add('busy'); else el.classList.remove('busy');
+        }}
+
+        // Wave List (Logic fixed)
+        const doneTasks = kpiRaw.filter(k => k[0] <= currTime && k[1] == 'PICKING');
+        const doneByWave = {{}};
+        doneTasks.forEach(k => {{ doneByWave[k[2]] = (doneByWave[k[2]] || 0) + 1; }});
+        
+        let waveHtml = '';
+        const allWaves = Object.keys(waveStats).sort();
+        let activeCount = 0;
+        
+        allWaves.forEach(wid => {{
+            const stat = waveStats[wid];
+            const total = stat.total;
+            const done = doneByWave[wid] || 0;
+            const delayed = stat.delayed;
+            
+            // [修正點 2] JS 語法修正: Python f-string 需要雙大括號
+            const isCompleted = done >= total;
+            const hasIssue = delayed > 0;
+            
+            if (!isCompleted || hasIssue) {{
+                const pct = total > 0 ? (done/total*100).toFixed(0) : 0;
+                const barColor = isCompleted ? '#6c757d' : '#007bff';
+                const borderClass = hasIssue ? 'delayed' : '';
+                // 這裡使用雙大括號跳脫
+                const delayTag = hasIssue ? `<span style="color:red;font-weight:bold;margin-left:5px">(${{delayed}} 延遲)</span>` : '';
+                
+                waveHtml += `
+                <div class="wave-item ${{borderClass}}">
+                    <div class="wave-header">
+                        <span>${{wid}} ${{delayTag}}</span>
+                        <span>${{done}}/${{total}}</span>
+                    </div>
+                    <div class="progress"><div class="progress-bar" style="width:${{pct}}%; background:${{barColor}}"></div></div>
+                </div>`;
+                activeCount++;
+            }}
+        }});
+        if(activeCount === 0) waveHtml = '<div style="color:#999;font-size:12px;text-align:center">目前無活躍波次</div>';
+        document.getElementById('wave-list').innerHTML = waveHtml;
+        
+        // Receiving Update
+        const now = new Date(currTime*1000);
+        const dateStr = now.toISOString().split('T')[0];
+        const dayTarget = recvTotals[dateStr] || 0;
+        const dayDone = kpiRaw.filter(k => k[0] <= currTime && k[4] == dateStr && k[1] == 'RECEIVING').length;
+        const backlog = Math.max(0, dayTarget - dayDone);
+        
+        document.getElementById('recv-txt').innerText = `${{dayDone}} / ${{dayTarget}}`;
+        document.getElementById('recv-backlog').innerText = backlog;
+        const rp = dayTarget>0 ? (dayDone/dayTarget*100) : 0;
+        document.getElementById('recv-bar').style.width = rp+'%';
+
+        document.getElementById('timeDisplay').innerText = now.toLocaleString();
+        document.getElementById('slider').value = currTime;
+    }}
+
+    function animate() {{
+        if(!isPlaying) return;
+        const spd = parseInt(document.getElementById('speed').value);
+        currTime += spd/30;
+        if(currTime > {max_time}) currTime = {min_time};
+        render();
+        requestAnimationFrame(animate);
+    }}
+    
+    function togglePlay() {{ isPlaying=!isPlaying; if(isPlaying) animate(); }}
+    document.getElementById('slider').addEventListener('input', e=>{{ currTime=parseInt(e.target.value); render(); }});
+    
+    render();
+</script>
+</body>
+</html>
+    """
+    
+    with open(OUTPUT_HTML, 'w', encoding='utf-8') as f:
+        f.write(html_content)
+    print(f"✅ 視覺化生成完畢: {OUTPUT_HTML}")
+
+if __name__ == "__main__":
+    main()
