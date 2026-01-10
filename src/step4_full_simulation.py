@@ -15,46 +15,71 @@ LOG_DIR = os.path.join(BASE_DIR, 'logs')
 os.makedirs(LOG_DIR, exist_ok=True)
 # ----------------------------------------
 
+class BatchWriter:
+    def __init__(self, filepath, header, chunk_size=5000):
+        self.f = open(filepath, 'w', newline='', encoding='utf-8')
+        self.writer = csv.writer(self.f)
+        self.writer.writerow(header)
+        self.buffer = []
+        self.chunk_size = chunk_size
+    
+    def writerow(self, row):
+        self.buffer.append(row)
+        if len(self.buffer) >= self.chunk_size:
+            self.flush()
+            
+    def flush(self):
+        if self.buffer:
+            self.writer.writerows(self.buffer)
+            self.buffer = []
+            
+    def close(self):
+        self.flush()
+        self.f.close()
+
 class TimeAwareAStar:
     def __init__(self, grid, reservations_dict, shelf_occupancy_set):
         self.grid = grid
         self.rows, self.cols = grid.shape
         self.reservations = reservations_dict
         self.shelf_occupancy = shelf_occupancy_set 
-        self.moves = [(0, 1), (0, -1), (1, 0), (-1, 0), (0, 0)] # E, W, S, N, Wait
-        self.max_steps = 3000 # Increased for complex shuffles
+        self.moves = [(0, 1), (0, -1), (1, 0), (-1, 0), (0, 0)] 
+        # [Speedup] Lower max steps to fail faster on impossible paths
+        self.max_steps = 1500 
 
     def heuristic(self, a, b):
+        # Manhattan distance
         return abs(a[0] - b[0]) + abs(a[1] - b[1])
 
     def find_path(self, start, goal, start_time_sec, static_blockers=None, is_loaded=False, ignore_dynamic=False, allow_tunneling=False):
         if not (0 <= start[0] < self.rows and 0 <= start[1] < self.cols): return None, None
         if not (0 <= goal[0] < self.rows and 0 <= goal[1] < self.cols): return None, None
         if self.grid[start[0]][start[1]] == -1: return None, None
-        # Goal check skipped here to allow finding path adjacent to blocked goal if needed, 
-        # but standard A* needs valid goal.
         if self.grid[goal[0]][goal[1]] == -1: return None, None
 
         if start == goal: return [(start, start_time_sec)], start_time_sec
         
-        # Dynamic timeout based on distance
+        # [Speedup] Dynamic Max Steps based on distance (tighter bound)
         dist = self.heuristic(start, goal)
-        dynamic_max_steps = max(2000, dist * 25) 
+        dynamic_max_steps = max(500, dist * 10) 
 
         open_set = []
         h_start = self.heuristic(start, goal)
         heapq.heappush(open_set, (h_start, h_start, start_time_sec, start, (0,0)))
         
-        came_from = {}
         g_score = {(start, start_time_sec, (0,0)): 0}
+        came_from = {}
         
         steps = 0
-        # Costs
+        
+        # [Speedup] Costs & Weights
+        # Higher Heuristic Weight (3.0) makes it "Greedy" -> Much Faster, slightly less optimal path
+        HEURISTIC_WEIGHT = 3.0 
+        
         NORMAL_COST = 1      
-        TURNING_COST = 1.5   
+        TURNING_COST = 1.0   
         WAIT_COST = 1.0       
-        HEURISTIC_WEIGHT = 1.2 
-        TUNNEL_COST = 20.0 
+        TUNNEL_COST = 50.0 
 
         while open_set:
             steps += 1
@@ -70,33 +95,40 @@ class TimeAwareAStar:
                 next_time = current_time + 1 
                 
                 if 0 <= nr < self.rows and 0 <= nc < self.cols:
-                    val = self.grid[nr][nc]
-                    if val == -1: continue 
+                    # [Optimization] Fast grid check using list access (assuming grid is valid)
+                    if self.grid[nr][nc] == -1: continue 
                     
-                    # 1. Dynamic Obstacles (Other AGVs)
+                    # 1. Dynamic Obstacles (Fast Check)
                     if not ignore_dynamic:
-                        # Only check near future to save performance
+                        # Only check if within 60s horizon
                         if (next_time - start_time_sec) < 60: 
-                            if next_time in self.reservations and (nr, nc) in self.reservations[next_time]:
-                                continue
-                    
-                    # 2. Static Obstacles (Shelves on floor)
-                    # If we are loaded, we cannot step on an occupied spot (unless it's the goal or start)
+                            if next_time in self.reservations:
+                                # Vertex Conflict
+                                if (nr, nc) in self.reservations[next_time]: continue
+                                
+                                # Edge Conflict (Swap)
+                                # Only check swap if current time also has reservations (lazy check)
+                                if current_time in self.reservations:
+                                    if ((nr, nc) in self.reservations[current_time]) and \
+                                       (current in self.reservations[next_time]):
+                                        continue
+
+                    # 2. Static Obstacles
                     is_spot_occupied = ((nr, nc) in self.shelf_occupancy)
                     step_cost = NORMAL_COST
                     
                     if is_loaded and is_spot_occupied:
                         if (nr, nc) != goal and (nr, nc) != start:
                             if allow_tunneling:
-                                step_cost = TUNNEL_COST # High cost to discourage but allow if desperate
+                                step_cost = TUNNEL_COST 
                             else:
                                 continue 
 
-                    # 3. Movement Costs
+                    # 3. Costs
                     if dr == 0 and dc == 0: step_cost += WAIT_COST
                     elif (dr, dc) != last_move and last_move != (0,0): step_cost += TURNING_COST
 
-                    new_g = g_score[(current, current_time, last_move)] + step_cost
+                    new_g = g_score.get((current, current_time, last_move), float('inf')) + step_cost
                     new_move = (dr, dc)
                     state_key = ((nr, nc), next_time, new_move)
                     
@@ -128,18 +160,14 @@ class TrafficController:
         self.reservations = reservations
 
     def clear_path_obstacles(self, start_pos, goal_pos, current_time, w_evt, floor, my_agv_name):
-        # Simplified Logic: Check immediate next step or simple straight line
-        # Finding exact blocker is hard without the failed path. 
-        # Here we scan a small box around the start/goal vector
+        # Raycast for blocker
         blocker_id = None
         blocker_pos = None
-        
         curr = list(start_pos)
         target = list(goal_pos)
         steps_checked = 0
         
-        # Simple raycast
-        while curr != target and steps_checked < 8:
+        while curr != target and steps_checked < 6: # Reduced check distance for speed
             if curr[0] < target[0]: curr[0] += 1
             elif curr[0] > target[0]: curr[0] -= 1
             elif curr[1] < target[1]: curr[1] += 1
@@ -157,50 +185,41 @@ class TrafficController:
             
         if not blocker_id: return False, 0
 
-        # Found a blocker AGV, tell it to move (Yield)
+        # Try to find sanctuary
         sanctuary = self._find_sanctuary(blocker_pos, current_time)
         if sanctuary:
             self.agv_pool[blocker_id]['pos'] = sanctuary
             dist = abs(blocker_pos[0]-sanctuary[0]) + abs(blocker_pos[1]-sanctuary[1])
             cost = dist * 2.0 
-            
-            # Record Yield Event
             w_evt.writerow([
                 datetime.fromtimestamp(current_time), datetime.fromtimestamp(current_time+int(cost)), 
                 floor, f"AGV_{blocker_id}", blocker_pos[1], blocker_pos[0], sanctuary[1], sanctuary[0], 'YIELD', f'Yield for {my_agv_name}'
             ])
-            
-            # Reserve space for the yielding AGV
             for t in range(int(cost) + 5):
                 self.reservations[current_time + t].add(sanctuary)
             return True, cost
-            
         return False, 0
 
     def _find_sanctuary(self, start_pos, current_time):
         q = deque([start_pos])
         visited = {start_pos}
-        max_search = 500 
+        max_search = 100 # Reduced from 500 for speed
         count = 0
         while q and count < max_search:
             curr = q.popleft()
             count += 1
-            
             if curr != start_pos and self.grid[curr[0]][curr[1]] != -1:
-                # Check if reserved
                 is_reserved = False
-                for t in range(5):
+                for t in range(3): # Reduced check horizon
                     if curr in self.reservations[current_time + t]:
                         is_reserved = True; break
                 if not is_reserved:
-                    # Check if occupied by another AGV
                     is_occupied = False
                     for state in self.agv_pool.values():
                         if state['pos'] == curr:
                             is_occupied = True; break
                     if not is_occupied:
                         return curr 
-            
             for dr, dc in [(0,1), (0,-1), (1,0), (-1,0)]:
                 nr, nc = curr[0]+dr, curr[1]+dc
                 if 0<=nr<self.rows and 0<=nc<self.cols:
@@ -218,14 +237,7 @@ class ShuffleManager:
         self.shelf_coords = shelf_coords
 
     def execute_real_shuffle(self, agv_pos, target_pos, w_evt, current_time, floor, agv_name, astar, res_table, write_move_fn, base_dt):
-        """
-        True Real-World Shuffle (Fixed for Unknown/Ghost Shelves):
-        1. Identify Blocker.
-        2. AGV moves to Blocker.
-        3. AGV moves Blocker to Buffer (Move Out).
-        """
         blockers = []
-        # Check 4 neighbors
         for dr, dc in [(0,1), (0,-1), (1,0), (-1,0)]:
             nr, nc = target_pos[0]+dr, target_pos[1]+dc
             if (nr, nc) in self.occupancy:
@@ -233,55 +245,43 @@ class ShuffleManager:
         
         if not blockers: return False, current_time, agv_pos
 
-        # Pick the first blocker
         blk_pos = blockers[0]
         sid = self.pos_to_id.get(blk_pos, "Unknown")
-        
-        # 1. Find Buffer
         buffer_pos = self._find_nearest_empty(blk_pos)
         if not buffer_pos: return False, current_time, agv_pos
 
         total_t = current_time
-
-        # --- STEP A: Move to Blocker ---
-        path_to_blk, end_t = astar.find_path(agv_pos, blk_pos, total_t, is_loaded=False, ignore_dynamic=True)
+        path_to_blk, end_t = astar.find_path(agv_pos, blk_pos, total_t, is_loaded=False, ignore_dynamic=True, allow_tunneling=True)
         if not path_to_blk: return False, current_time, agv_pos
         
         write_move_fn(w_evt, path_to_blk, floor, agv_name.replace("AGV_", ""), res_table)
         total_t = end_t
         
-        # Load Blocker Event
         w_evt.writerow([
             base_dt + timedelta(seconds=total_t), base_dt + timedelta(seconds=total_t+5), 
             floor, agv_name, blk_pos[1], blk_pos[0], blk_pos[1], blk_pos[0], 'SHUFFLE_LOAD', f"Moving {sid}"
         ])
         total_t += 5
-        if blk_pos in self.occupancy: self.occupancy.remove(blk_pos) # Lift up
+        if blk_pos in self.occupancy: self.occupancy.remove(blk_pos) 
 
-        # --- STEP B: Move Blocker to Buffer ---
-        path_to_buf, end_t = astar.find_path(blk_pos, buffer_pos, total_t, is_loaded=True, ignore_dynamic=True)
+        path_to_buf, end_t = astar.find_path(blk_pos, buffer_pos, total_t, is_loaded=True, ignore_dynamic=True, allow_tunneling=True)
+        
         if not path_to_buf:
-            self.occupancy.add(blk_pos) # Failed, put back
+            self.occupancy.add(blk_pos) 
             return False, current_time, agv_pos
         
         write_move_fn(w_evt, path_to_buf, floor, agv_name.replace("AGV_", ""), res_table)
         total_t = end_t
         
-        # Unload Blocker Event
         w_evt.writerow([
             base_dt + timedelta(seconds=total_t), base_dt + timedelta(seconds=total_t+5), 
             floor, agv_name, buffer_pos[1], buffer_pos[0], buffer_pos[1], buffer_pos[0], 'SHUFFLE_UNLOAD', f"Placed {sid}"
         ])
         total_t += 5
         
-        # Update Logical State
         self.occupancy.add(buffer_pos)
-        
-        # [FIX] 防呆機制：只有當 ID 存在於資料庫時才更新座標
         if sid != "Unknown" and sid in self.shelf_coords:
             self.shelf_coords[sid]['pos'] = buffer_pos
-            
-        # Update lookup map
         if blk_pos in self.pos_to_id:
             del self.pos_to_id[blk_pos]
         self.pos_to_id[buffer_pos] = sid
@@ -291,14 +291,12 @@ class ShuffleManager:
     def _find_nearest_empty(self, start_pos):
         q = deque([start_pos])
         visited = {start_pos}
-        max_dist = 15 
+        max_dist = 40 
         while q:
             curr = q.popleft()
             if self.grid[curr[0]][curr[1]] != -1 and curr not in self.occupancy:
                 return curr
-            
             if abs(curr[0]-start_pos[0]) + abs(curr[1]-start_pos[1]) > max_dist: continue
-            
             for dr, dc in [(0,1), (0,-1), (1,0), (-1,0)]:
                 nr, nc = curr[0]+dr, curr[1]+dc
                 if 0<=nr<self.rows and 0<=nc<self.cols:
@@ -308,25 +306,46 @@ class ShuffleManager:
         return None
 
 class ParkingManager:
-    def __init__(self, grid, shelf_occupancy):
+    def __init__(self, grid, valid_storage_spots, shelf_occupancy):
         self.grid = grid
+        self.rows, self.cols = grid.shape
         self.shelf_occupancy = shelf_occupancy
+        # Convert to list for fast random sampling
+        self.valid_spots_list = list(valid_storage_spots)
     
-    def find_parking_spot(self, current_pos, active_shelves_pos):
+    def get_fast_parking_spot(self):
+        """
+        [Optimization] Global Parking Search
+        Instead of BFS, just pick a random empty spot from the valid list.
+        Significantly faster than BFS scanning.
+        """
+        attempts = 0
+        while attempts < 20:
+            spot = random.choice(self.valid_spots_list)
+            if spot not in self.shelf_occupancy:
+                return spot
+            attempts += 1
+        
+        # Fallback to linear scan if random fails
+        for spot in self.valid_spots_list:
+            if spot not in self.shelf_occupancy:
+                return spot
+        return None
+
+    # Keep BFS for specific local searches if needed, but primary use is the fast one above
+    def find_parking_spot_bfs(self, current_pos, active_shelves_pos):
         q = deque([current_pos])
         visited = {current_pos}
-        while q:
+        max_scan = 200 # Limited scan
+        count = 0
+        while q and count < max_scan:
             curr = q.popleft()
-            # Valid parking: Not occupied by shelf, not active shelf
+            count += 1
             if curr in self.shelf_occupancy and curr not in active_shelves_pos:
                 return curr
-            
-            if abs(curr[0]-current_pos[0]) + abs(curr[1]-current_pos[1]) > 50:
-                continue
-                
             for dr, dc in [(0,1), (0,-1), (1,0), (-1,0)]:
                 nr, nc = curr[0]+dr, curr[1]+dc
-                if 0<=nr<self.grid.shape[0] and 0<=nc<self.grid.shape[1]:
+                if 0<=nr<self.rows and 0<=nc<self.cols:
                     if (nr, nc) not in visited:
                         visited.add((nr, nc))
                         q.append((nr, nc))
@@ -334,7 +353,6 @@ class ParkingManager:
 
 class OrderProcessor:
     def __init__(self, stations_2f, stations_3f):
-        # Stations keys are now strings like '2F_1', '3F_1'
         self.stations = {'2F': list(stations_2f.keys()), '3F': list(stations_3f.keys())}
         self.cust_station_map = {} 
 
@@ -343,7 +361,6 @@ class OrderProcessor:
         available_stations = self.stations.get(floor, [])
         if not available_stations: return []
         
-        # Assign customers to stations
         for i, cust_id in enumerate(wave_custs):
             if cust_id not in self.cust_station_map:
                 st_idx = i % len(available_stations)
@@ -353,14 +370,11 @@ class OrderProcessor:
         for _, row in wave_orders.iterrows():
             loc = str(row.get('LOC', '')).strip()
             if len(loc) < 9: continue 
-            
             shelf_id = loc[:9]
             face = loc[10] if len(loc) > 10 else 'A'
             cust_id = row.get('PARTCUSTID')
-            
             target_st = self.cust_station_map.get(cust_id)
             if not target_st: target_st = random.choice(available_stations)
-            
             shelf_tasks[shelf_id].append({
                 'face': face, 'station': target_st,
                 'sku': f"{row.get('FRCD','')}_{row.get('PARTNO','')}",
@@ -369,24 +383,19 @@ class OrderProcessor:
 
         final_tasks = []
         for shelf_id, orders in shelf_tasks.items():
-            # Optimize picking sequence at station
             orders.sort(key=lambda x: (x['station'], x['face']))
             stops = []
-            
             current_st = None
             current_face = None
             current_sku_group = defaultdict(int) 
-            
             for o in orders:
                 st = o['station']
                 face = o['face']
                 sku = o['sku']
-                
                 if (st != current_st or face != current_face) and current_st is not None:
                     proc_time = self._calc_time(current_sku_group)
                     stops.append({'station': current_st, 'face': current_face, 'time': proc_time})
                     current_sku_group = defaultdict(int)
-                
                 current_st = st
                 current_face = face
                 current_sku_group[sku] += 1
@@ -409,7 +418,7 @@ class OrderProcessor:
 
 class AdvancedSimulationRunner:
     def __init__(self):
-        print(f"🚀 [Step 4] 啟動進階模擬 (V42: Real Shuffle & KPI Fix)...")
+        print(f"🚀 [Step 4] 啟動進階模擬 (V46: High Performance Edition)...")
         
         self.grid_2f = self._load_map_correct('2F_map.xlsx', 32, 61)
         self.grid_3f = self._load_map_correct('3F_map.xlsx', 32, 61)
@@ -422,7 +431,6 @@ class AdvancedSimulationRunner:
         self.pos_to_sid_2f = {}
         self.pos_to_sid_3f = {}
         
-        # Init Grids
         r2, c2 = self.grid_2f.shape
         for r in range(r2):
             for c in range(c2):
@@ -445,11 +453,8 @@ class AdvancedSimulationRunner:
             
         self.inventory_map = self._load_inventory() 
         self.all_tasks_raw = self._load_all_tasks()
-        
-        # Stickiness Logic
         self._assign_locations_smartly(self.all_tasks_raw)
         
-        # Station Init (Updated for Standard Naming)
         self.stations = self._init_stations()
         st_2f = {k:v for k,v in self.stations.items() if v['floor']=='2F'}
         st_3f = {k:v for k,v in self.stations.items() if v['floor']=='3F'}
@@ -459,7 +464,6 @@ class AdvancedSimulationRunner:
         self.used_spots_2f = set()
         self.used_spots_3f = set()
         
-        # AGV Init
         self.agv_state = {
             '2F': {i: {'time': 0, 'pos': self._get_strict_spawn_spot(self.grid_2f, self.used_spots_2f, '2F')} for i in range(1, 19)},
             '3F': {i: {'time': 0, 'pos': self._get_strict_spawn_spot(self.grid_3f, self.used_spots_3f, '3F')} for i in range(101, 119)}
@@ -469,8 +473,10 @@ class AdvancedSimulationRunner:
         self.shuffler_3f = ShuffleManager(self.grid_3f, self.shelf_occupancy['3F'], self.pos_to_sid_3f, self.shelf_coords)
         self.traffic_2f = TrafficController(self.grid_2f, self.agv_state['2F'], self.reservations_2f)
         self.traffic_3f = TrafficController(self.grid_3f, self.agv_state['3F'], self.reservations_3f)
-        self.parking_2f = ParkingManager(self.grid_2f, self.shelf_occupancy['2F'])
-        self.parking_3f = ParkingManager(self.grid_3f, self.shelf_occupancy['3F'])
+        
+        # [Speedup] Pass valid spots to ParkingManager
+        self.parking_2f = ParkingManager(self.grid_2f, self.valid_storage_spots['2F'], self.shelf_occupancy['2F'])
+        self.parking_3f = ParkingManager(self.grid_3f, self.valid_storage_spots['3F'], self.shelf_occupancy['3F'])
         
         self.wave_totals = {}
         self.recv_totals = {}
@@ -480,7 +486,7 @@ class AdvancedSimulationRunner:
             if 'RECEIVING' in wid: self.recv_totals[d_str] = self.recv_totals.get(d_str, 0) + 1
             else: self.wave_totals[wid] = self.wave_totals.get(wid, 0) + 1
             
-        self.teleport_heatmap = Counter()
+        self.teleport_reasons = Counter()
 
     def _load_inventory(self):
         path = os.path.join(BASE_DIR, 'data', 'master', 'item_inventory.csv')
@@ -533,20 +539,16 @@ class AdvancedSimulationRunner:
         print("   -> Running Inventory Consolidation (Stickiness Mode)...")
         part_shelf_map = {}
         valid_shelves = list(self.shelf_coords.keys())
-        
         for t in tasks:
             part = str(t.get('PARTNO', '')).strip()
             loc = str(t.get('LOC', '')).strip()
             if len(loc) >= 9:
                 if part not in part_shelf_map:
                     part_shelf_map[part] = loc 
-
         for t in tasks:
             loc = str(t.get('LOC', '')).strip()
             if len(loc) >= 9: continue 
-            
             part = str(t.get('PARTNO', '')).strip()
-            
             if part in part_shelf_map:
                 t['LOC'] = part_shelf_map[part]
             else:
@@ -580,7 +582,10 @@ class AdvancedSimulationRunner:
         candidates = []
         agv_positions = [s['pos'] for s in agv_pool.values()]
         
-        for spot in valid_spots:
+        # [Speedup] Only check a sample of spots, not all thousands
+        sample_spots = random.sample(list(valid_spots), min(limit*2, len(valid_spots)))
+        
+        for spot in sample_spots:
             if spot not in shelf_occupied_spots and spot not in occupied_spots:
                 dist = abs(spot[0]-start_pos[0]) + abs(spot[1]-start_pos[1])
                 crowd_penalty = 0
@@ -641,19 +646,14 @@ class AdvancedSimulationRunner:
                     if grid[r][c] == 2: candidates.append((r, c))
             candidates.sort() 
             return candidates
-            
-        # 2F Stations: WS_2F_1, WS_2F_2 ...
         cands_2f = find_stations(self.grid_2f)
         for i, pos in enumerate(cands_2f):
             sid = f"2F_{i + 1}" 
             sts[sid] = {'floor': '2F', 'pos': pos, 'free_time': 0}
-            
-        # 3F Stations: WS_3F_1, WS_3F_2 ...
         cands_3f = find_stations(self.grid_3f)
         for i, pos in enumerate(cands_3f):
             sid = f"3F_{i + 1}"
             sts[sid] = {'floor': '3F', 'pos': pos, 'free_time': 0}
-            
         return sts
 
     def _is_physically_connected(self, grid, start, end):
@@ -689,7 +689,7 @@ class AdvancedSimulationRunner:
         to_del = [t for t in res_table if t < cutoff]
         for t in to_del: del res_table[t]
 
-    def _move_agv_segment(self, start_p, end_p, start_t, loaded, agv_name, floor, astar, shuffler, traffic_ctrl, w_evt, res_table, grid, is_returning=False, agv_pool=None):
+    def _move_agv_segment(self, start_p, end_p, start_t, loaded, agv_name, floor, astar, shuffler, traffic_ctrl, w_evt, res_table, grid, is_returning=False, agv_pool=None, reason_label="GENERIC"):
         curr = start_p
         target = end_p
         t = start_t
@@ -698,8 +698,8 @@ class AdvancedSimulationRunner:
         
         if not self._is_physically_connected(grid, curr, target):
              t += 120
-             w_evt.writerow([self.to_dt(t-120), self.to_dt(t), floor, agv_name, curr[1], curr[0], target[1], target[0], 'AGV_MOVE', 'TELEPORT'])
-             self.teleport_heatmap[curr] += 1
+             w_evt.writerow([self.to_dt(t-120), self.to_dt(t), floor, agv_name, curr[1], curr[0], target[1], target[0], 'AGV_MOVE', 'TELE_UNREACHABLE'])
+             self.teleport_reasons[f"{reason_label}:UNREACHABLE"] += 1
              return target, t, True
 
         retry_count = 0 
@@ -707,46 +707,50 @@ class AdvancedSimulationRunner:
         while curr != target:
             if t - start_wait > TIMEOUT_LIMIT:
                 t += 60 
-                w_evt.writerow([self.to_dt(t-60), self.to_dt(t), floor, agv_name, curr[1], curr[0], target[1], target[0], 'AGV_MOVE', 'FORCE_TELE'])
-                self.teleport_heatmap[curr] += 1 
+                w_evt.writerow([self.to_dt(t-60), self.to_dt(t), floor, agv_name, curr[1], curr[0], target[1], target[0], 'AGV_MOVE', 'TELE_STUCK'])
+                self.teleport_reasons[f"{reason_label}:STUCK"] += 1
                 return target, t, True
 
             path, _ = astar.find_path(curr, target, t, is_loaded=loaded, ignore_dynamic=False)
             
-            # Fast Return Rerouting
-            if not path and is_returning and retry_count > 2:
-                new_candidates = self._find_smart_storage_spot(
+            if not path and is_returning and retry_count > 1:
+                 # [Speedup] Try random caching if standard return path fails
+                 new_candidates = self._find_smart_storage_spot(
                     curr, self.valid_storage_spots[floor], 
-                    {s['pos'] for k,s in agv_pool.items()}, self.shelf_occupancy[floor], agv_pool, grid, limit=20
-                )
-                if new_candidates:
+                    {s['pos'] for k,s in agv_pool.items()}, self.shelf_occupancy[floor], agv_pool, grid, limit=10
+                 )
+                 if new_candidates:
                     target = new_candidates[0]
                     retry_count = 0 
                     continue
 
-            # Traffic Control (Yielding)
-            if not path and (t - start_wait > 5):
+            if not path and (t - start_wait > 3): 
                 success, penalty = traffic_ctrl.clear_path_obstacles(curr, target, t, w_evt, floor, agv_name)
                 if success:
                     t += int(penalty)
                     continue
 
-            # Shuffle Logic (Real Move)
-            if not path and (t - start_wait > 10): 
-                # [V42 Change] execute_real_shuffle performs the move physically
+            if not path and (t - start_wait > 5): 
                 success, new_t, new_pos = shuffler.execute_real_shuffle(
                     curr, target, w_evt, t, floor, agv_name, astar, res_table, self.write_move_events, self.base_time
                 )
                 if success:
                     t = new_t
-                    curr = new_pos # AGV has moved to buffer and dropped off blocker
-                    # Continue loop to replan from buffer to original target
+                    curr = new_pos 
                     continue 
             
-            # Tunneling
-            if not path and (t - start_wait > 30):
+            if not path and (t - start_wait > 20):
+                 path, _ = astar.find_path(curr, target, t, is_loaded=loaded, ignore_dynamic=False, allow_tunneling=True)
+                 if path: t += 30 
+
+            if not path and (t - start_wait > 45):
                  path, _ = astar.find_path(curr, target, t, is_loaded=loaded, ignore_dynamic=True, allow_tunneling=True)
                  if path: t += 30 
+                 if not path:
+                     t += 60
+                     w_evt.writerow([self.to_dt(t-60), self.to_dt(t), floor, agv_name, curr[1], curr[0], target[1], target[0], 'AGV_MOVE', 'TELE_NO_PATH'])
+                     self.teleport_reasons[f"{reason_label}:NO_PATH"] += 1
+                     return target, t, True
 
             if path:
                 self.write_move_events(w_evt, path, floor, agv_name.replace("AGV_", ""), res_table)
@@ -769,9 +773,9 @@ class AdvancedSimulationRunner:
         astar_2f = TimeAwareAStar(self.grid_2f, self.reservations_2f, self.shelf_occupancy['2F'])
         astar_3f = TimeAwareAStar(self.grid_3f, self.reservations_3f, self.shelf_occupancy['3F'])
         
-        f_evt = open(os.path.join(LOG_DIR, 'simulation_events.csv'), 'w', newline='', encoding='utf-8')
-        w_evt = csv.writer(f_evt)
-        w_evt.writerow(['start_time', 'end_time', 'floor', 'obj_id', 'sx', 'sy', 'ex', 'ey', 'type', 'text'])
+        # [Speedup] Use BatchWriter for Events
+        w_evt = BatchWriter(os.path.join(LOG_DIR, 'simulation_events.csv'), ['start_time', 'end_time', 'floor', 'obj_id', 'sx', 'sy', 'ex', 'ey', 'type', 'text'])
+        # KPI is low volume, csv.writer is fine
         f_kpi = open(os.path.join(LOG_DIR, 'simulation_kpi.csv'), 'w', newline='', encoding='utf-8')
         w_kpi = csv.writer(f_kpi)
         w_kpi.writerow(['finish_time', 'type', 'wave_id', 'is_delayed', 'date', 'workstation', 'total_in_wave', 'deadline_ts'])
@@ -790,14 +794,13 @@ class AdvancedSimulationRunner:
             
         total_tasks = len(task_queue_2f) + len(task_queue_3f)
         
-        print(f"🎬 開始模擬... (V42: Real Physical Shuffle)")
+        print(f"🎬 開始模擬... (V46: High Performance Edition)")
         print(f"   -> 原始訂單: {len(self.all_tasks_raw)} | AGV任務: {total_tasks}")
         
-        # Init outputs
         for floor in ['2F', '3F']:
             for sid, info in self.stations.items():
                 if info['floor'] == floor:
-                    display_id = sid.split('_')[1] # WS_2F_1 -> 1
+                    display_id = sid.split('_')[1] 
                     w_evt.writerow([self.to_dt(0), self.to_dt(1), floor, f"WS_{sid}", info['pos'][1], info['pos'][0], info['pos'][1], info['pos'][0], 'STATION_STATUS', f'WHITE|Station {display_id}|N'])
             for agv_id, state in self.agv_state[floor].items():
                 pos = state['pos']
@@ -843,7 +846,7 @@ class AdvancedSimulationRunner:
                 agv_pos, current_t, tele_1 = self._move_agv_segment(
                     agv_pos, shelf_pos, current_t, False, f"AGV_{best_agv}", 
                     floor, astar, shuffler, traffic, w_evt, res_table, grid,
-                    is_returning=False, agv_pool=agv_pool
+                    is_returning=False, agv_pool=agv_pool, reason_label="LOAD"
                 )
                 if tele_1: stats['Load'] += 1
                 
@@ -865,18 +868,20 @@ class AdvancedSimulationRunner:
                             nearby_agvs += 1
                     
                     if nearby_agvs > 3: 
-                        park_spot = parking.find_parking_spot(current_shelf_pos, set())
+                        # [Speedup] Use global fast parking search
+                        park_spot = parking.get_fast_parking_spot()
                         if park_spot:
                             current_shelf_pos, current_t, _ = self._move_agv_segment(
                                 current_shelf_pos, park_spot, current_t, True, f"AGV_{best_agv}",
-                                floor, astar, shuffler, traffic, w_evt, res_table, grid, is_returning=False, agv_pool=agv_pool
+                                floor, astar, shuffler, traffic, w_evt, res_table, grid, 
+                                is_returning=False, agv_pool=agv_pool, reason_label="PARK_TEMP"
                             )
                             current_t += 20 
                     
                     current_shelf_pos, current_t, tele_2 = self._move_agv_segment(
                         current_shelf_pos, st_pos, current_t, True, f"AGV_{best_agv}",
                         floor, astar, shuffler, traffic, w_evt, res_table, grid,
-                        is_returning=False, agv_pool=agv_pool
+                        is_returning=False, agv_pool=agv_pool, reason_label="VISIT"
                     )
                     if tele_2: stats['Visit'] += 1
                     
@@ -887,10 +892,10 @@ class AdvancedSimulationRunner:
                     for t in range(current_t, int(leave_t)): res_table[t].add(st_pos)
                     current_t = int(leave_t)
                 
-                # 3. Return (Smart & Dispersed & Island-Aware)
+                # 3. Return
                 candidates = self._find_smart_storage_spot(
                     current_shelf_pos, self.valid_storage_spots[floor], 
-                    {s['pos'] for k,s in agv_pool.items()}, self.shelf_occupancy[floor], agv_pool, grid, limit=50
+                    {s['pos'] for k,s in agv_pool.items()}, self.shelf_occupancy[floor], agv_pool, grid, limit=20
                 )
                 if not candidates: candidates = [shelf_pos]
                 drop_pos = candidates[0]
@@ -901,7 +906,7 @@ class AdvancedSimulationRunner:
                 current_shelf_pos, current_t, tele_3 = self._move_agv_segment(
                     current_shelf_pos, drop_pos, current_t, True, f"AGV_{best_agv}",
                     floor, astar, shuffler, traffic, w_evt, res_table, grid,
-                    is_returning=True, agv_pool=agv_pool
+                    is_returning=True, agv_pool=agv_pool, reason_label="RETURN"
                 )
                 if tele_3: stats['Return'] += 1
 
@@ -913,7 +918,7 @@ class AdvancedSimulationRunner:
                 self.agv_state[floor][best_agv]['pos'] = drop_pos
                 self.agv_state[floor][best_agv]['time'] = current_t
                 
-                # 4. Aggressive Parking
+                # 4. Aggressive Parking (Optimized)
                 nearest_st_dist = float('inf')
                 for st_info in self.stations.values():
                     if st_info['floor'] == floor:
@@ -921,11 +926,13 @@ class AdvancedSimulationRunner:
                         if d < nearest_st_dist: nearest_st_dist = d
                 
                 if nearest_st_dist < 10:
-                    park_spot = parking.find_parking_spot(drop_pos, set())
+                    # [Speedup] Use global fast parking search
+                    park_spot = parking.get_fast_parking_spot()
                     if park_spot:
                         current_shelf_pos, current_t, tele_4 = self._move_agv_segment(
                             drop_pos, park_spot, current_t, False, f"AGV_{best_agv}",
-                            floor, astar, shuffler, traffic, w_evt, res_table, grid, is_returning=False, agv_pool=agv_pool
+                            floor, astar, shuffler, traffic, w_evt, res_table, grid, 
+                            is_returning=False, agv_pool=agv_pool, reason_label="PARK_FINAL"
                         )
                         if not tele_4:
                             self.agv_state[floor][best_agv]['pos'] = park_spot
@@ -933,16 +940,12 @@ class AdvancedSimulationRunner:
                             w_evt.writerow([self.to_dt(current_t), self.to_dt(current_t+1), floor, f"AGV_{best_agv}", park_spot[1], park_spot[0], park_spot[1], park_spot[0], 'PARKING', 'Hidden'])
                             stats['Park'] += 1
 
-                # KPI Logging (Fixed)
                 for raw_o in task['raw_orders']:
                      wid = raw_o.get('WAVE_ID', 'UNK')
                      ttype = 'INBOUND' if 'RECEIVING' in wid else 'OUTBOUND'
                      total_wave_count = self.wave_totals.get(wid, 0)
-                     # Deadline default 4h
                      deadline_dt = self.to_dt(0) + timedelta(hours=4)
-                     
-                     st_label = f"WS_{task['stops'][-1]['station']}" # e.g. WS_2F_1
-                     
+                     st_label = f"WS_{task['stops'][-1]['station']}" 
                      w_kpi.writerow([
                          self.to_dt(current_t), ttype, wid, 'N', 
                          self.to_dt(current_t).date(), st_label, 
@@ -951,17 +954,17 @@ class AdvancedSimulationRunner:
 
                 done_count += 1
                 
-                if done_count % 10 == 0 or done_count == total_tasks: 
+                if done_count % 50 == 0 or done_count == total_tasks: 
                      elapsed = time.time()-start_real
                      print(f"\r🚀 進度:{done_count} | ⏱️ {elapsed:.0f}s | ⚡ Load:{stats['Load']} | Visit:{stats['Visit']} | Return:{stats['Return']} | 🅿️ Park:{stats['Park']}", end='')
                      self._cleanup_reservations(res_table, current_t)
 
-        f_evt.close()
+        w_evt.close()
         f_kpi.close()
         print(f"\n✅ 模擬完成！ Total Teleports: {sum(stats.values())}")
-        print("\n🔥 [Top 3 Death Spots (Teleport Hotspots)]")
-        for pos, count in self.teleport_heatmap.most_common(3):
-            print(f"   📍 座標 {pos}: {count} 次 (建議檢查該區域是否為死路)")
+        print("\n🔥 [Teleport Diagnosis Breakdown]")
+        for reason, count in self.teleport_reasons.most_common(10):
+            print(f"   ⚠️ {reason}: {count} 次")
 
 if __name__ == "__main__":
     AdvancedSimulationRunner().run()
