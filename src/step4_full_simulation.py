@@ -23,57 +23,91 @@ class TimeAwareAStar:
     def heuristic(self, a, b):
         return abs(a[0] - b[0]) + abs(a[1] - b[1])
 
-    def find_path(self, start, goal, start_time_sec, static_blockers=None, is_loaded=False):
+    def find_path(self, start, goal, start_time_sec, static_blockers=None, is_loaded=False, ignore_dynamic=False):
         if start == goal: return [(start, start_time_sec)], start_time_sec
         if not (0 <= start[0] < self.rows and 0 <= start[1] < self.cols): return None, None
+        
         if static_blockers is None: static_blockers = set()
+
         open_set = []
         h_start = self.heuristic(start, goal)
         heapq.heappush(open_set, (h_start, h_start, start_time_sec, start, (0,0)))
+        
         came_from = {}
         g_score = {(start, start_time_sec, (0,0)): 0}
-        max_steps = 5000 
+        
+        max_steps = 6000 # Increased limit
         steps = 0
+        
         NORMAL_COST = 1      
         OBSTACLE_COST = 9999 
         TURNING_COST = 2.0   
         WAIT_COST = 1.5      
         HEURISTIC_WEIGHT = 2.0 
         HORIZON_LIMIT = 30 
-        min_h = float('inf')
+
         best_node = None
+        min_h = float('inf')
 
         while open_set:
             steps += 1
             if steps > max_steps: break 
-            f, h, current_time, current, last_move = heapq.heappop(open_set)
-            if h < min_h: min_h = h; best_node = (current, current_time, last_move)
-            if current == goal: return self._reconstruct_path(came_from, (current, current_time, last_move), start, start_time_sec)
             
+            f, h, current_time, current, last_move = heapq.heappop(open_set)
+
+            if h < min_h:
+                min_h = h
+                best_node = (current, current_time, last_move)
+
+            if current == goal:
+                return self._reconstruct_path(came_from, (current, current_time, last_move), start, start_time_sec)
+
             for dr, dc in self.moves:
                 nr, nc = current[0] + dr, current[1] + dc
                 next_time = current_time + 1 
+                
                 if 0 <= nr < self.rows and 0 <= nc < self.cols:
-                    if (nr, nc) in static_blockers and (nr, nc) != goal and (nr, nc) != start: continue
+                    # 1. Static Blockers (Other AGVs fixed pos)
+                    if not ignore_dynamic:
+                        if (nr, nc) in static_blockers and (nr, nc) != goal and (nr, nc) != start:
+                            continue
+
                     val = self.grid[nr][nc]
                     step_cost = NORMAL_COST
-                    if val == -1: step_cost = OBSTACLE_COST 
+                    
+                    # 2. Map Obstacles
+                    if val == -1: 
+                        step_cost = OBSTACLE_COST # Wall is always obstacle
                     elif val == 1:
+                        # Shelf area
                         if (nr, nc) in self.valid_storage_spots: 
-                            if is_loaded and (nr, nc) != goal and (nr, nc) != start: step_cost = OBSTACLE_COST
-                            else: step_cost = NORMAL_COST
-                        elif (nr, nc) != goal and (nr, nc) != start: step_cost = OBSTACLE_COST
+                            if is_loaded:
+                                # Loaded: treat other shelves as obstacles unless ignore_dynamic=True (Soft Fallback)
+                                if not ignore_dynamic and (nr, nc) != goal and (nr, nc) != start:
+                                    step_cost = OBSTACLE_COST
+                                else:
+                                    step_cost = NORMAL_COST * 2 # Penalty for moving through shelves
+                            else:
+                                step_cost = NORMAL_COST
+                        else:
+                            # Non-valid spot but marked as 1? Treat as obstacle
+                            if (nr, nc) != goal and (nr, nc) != start: step_cost = OBSTACLE_COST
                     
                     if step_cost >= OBSTACLE_COST: continue
-                    if (next_time - start_time_sec) < HORIZON_LIMIT:
-                        if next_time in self.reservations and (nr, nc) in self.reservations[next_time]: continue
+
+                    # 3. Dynamic Reservations
+                    if not ignore_dynamic:
+                        if (next_time - start_time_sec) < HORIZON_LIMIT:
+                            if next_time in self.reservations and (nr, nc) in self.reservations[next_time]:
+                                continue
                     
                     if dr == 0 and dc == 0: step_cost += WAIT_COST
                     elif (dr, dc) != last_move and last_move != (0,0): step_cost += TURNING_COST
-                    
+
                     new_g = g_score[(current, current_time, last_move)] + step_cost
                     new_move = (dr, dc)
                     state_key = ((nr, nc), next_time, new_move)
+                    
                     if state_key not in g_score or new_g < g_score[state_key]:
                         g_score[state_key] = new_g
                         h = self.heuristic((nr, nc), goal)
@@ -81,7 +115,10 @@ class TimeAwareAStar:
                         heapq.heappush(open_set, (f, h, next_time, (nr, nc), new_move))
                         came_from[state_key] = (current, current_time, last_move)
                         
-        if best_node: return self._reconstruct_path(came_from, best_node, start, start_time_sec)
+        if best_node and ignore_dynamic:
+             # In fallback mode, return partial path if goal not reached
+             return self._reconstruct_path(came_from, best_node, start, start_time_sec)
+             
         return None, None
 
     def _reconstruct_path(self, came_from, current_node, start_pos, start_time):
@@ -97,7 +134,6 @@ class TimeAwareAStar:
 
 class OrderProcessor:
     def __init__(self, stations_2f, stations_3f):
-        # [V49] Ensure stations are list of IDs
         self.stations = {'2F': list(stations_2f.keys()), '3F': list(stations_3f.keys())}
         self.cust_station_map = {} 
         
@@ -161,7 +197,7 @@ class OrderProcessor:
 
 class AdvancedSimulationRunner:
     def __init__(self):
-        print(f"🚀 [Step 4] 啟動進階模擬 (V49: Station IDs & Coord Fix)...")
+        print(f"🚀 [Step 4] 啟動進階模擬 (V50: Smart Fallback & Strict Stations)...")
         
         self.grid_2f = self._load_map_correct('2F_map.xlsx', 32, 61)
         self.grid_3f = self._load_map_correct('3F_map.xlsx', 32, 61)
@@ -181,7 +217,7 @@ class AdvancedSimulationRunner:
         self.all_tasks_raw = self._load_all_tasks()
         self._assign_locations_smartly(self.all_tasks_raw)
         
-        # [V49] Explicitly init stations
+        # [V50 Fix] Stations Init Logic
         self.stations = self._init_stations()
         st_2f = {k:v for k,v in self.stations.items() if v['floor']=='2F'}
         st_3f = {k:v for k,v in self.stations.items() if v['floor']=='3F'}
@@ -348,57 +384,36 @@ class AdvancedSimulationRunner:
 
     def _init_stations(self):
         sts = {}
-        # [V49] 強制掃描地圖上的所有工作站 (value=2)，並按照座標排序
-        # 確保 2F 有 8 台 (1-8)，3F 有 8 台 (101-108)
-        
+        # [V50 Fix] Strict 8 stations per floor
         def find_stations(grid):
             candidates = []
             rows, cols = grid.shape
             for r in range(rows):
                 for c in range(cols):
-                    if grid[r][c] == 2:
-                        candidates.append((r, c))
-            # Sort by row then col (visual order)
-            candidates.sort()
+                    if grid[r][c] == 2: candidates.append((r, c))
+            candidates.sort() # Sort by coordinate
             return candidates
 
-        # 2F Init
         cands_2f = find_stations(self.grid_2f)
-        # Force exactly 8 stations for 2F
         for i in range(8):
             sid = i + 1
-            if i < len(cands_2f):
-                pos = cands_2f[i]
-            else:
-                # Not enough stations on map, reuse last one or dummy
-                pos = cands_2f[-1] if cands_2f else (0,0)
+            pos = cands_2f[i] if i < len(cands_2f) else (cands_2f[-1] if cands_2f else (0,0))
             sts[sid] = {'floor': '2F', 'pos': pos, 'free_time': 0}
 
-        # 3F Init
         cands_3f = find_stations(self.grid_3f)
         for i in range(8):
             sid = 101 + i
-            if i < len(cands_3f):
-                pos = cands_3f[i]
-            else:
-                pos = cands_3f[-1] if cands_3f else (0,0)
+            pos = cands_3f[i] if i < len(cands_3f) else (cands_3f[-1] if cands_3f else (0,0))
             sts[sid] = {'floor': '3F', 'pos': pos, 'free_time': 0}
             
         return sts
 
     def write_move_events(self, writer, path, floor, agv_id, res_table):
         if not path or len(path) < 2: return
-        # [V49 Fix] Ensure coords are written as (x, y) correctly in CSV
-        # path elements are ((r, c), time) -> (y, x)
-        # CSV expects sx, sy, ex, ey -> x, y, x, y
         for i in range(len(path) - 1):
             curr_pos, curr_t = path[i]
             next_pos, next_t = path[i+1]
-            
             res_table[curr_t].add(curr_pos)
-            
-            # Note: curr_pos is (row, col) = (y, x)
-            # CSV wants x, y
             writer.writerow([
                 self.to_dt(curr_t), self.to_dt(next_t), floor, f"AGV_{agv_id}",
                 curr_pos[1], curr_pos[0], next_pos[1], next_pos[0], 'AGV_MOVE', ''
@@ -414,39 +429,54 @@ class AdvancedSimulationRunner:
         curr = list(start)
         t = start_time
         path.append((tuple(curr), t))
-        
-        # [V49 Fix] Ensure we don't go out of bounds (0~31, 0~60)
-        # This fixes "drifting" if logic was wrong
-        
         while curr[0] != end[0]:
             curr[0] += 1 if end[0] > curr[0] else -1
             t += 1
             path.append((tuple(curr), t))
-            
         while curr[1] != end[1]:
             curr[1] += 1 if end[1] > curr[1] else -1
             t += 1
             path.append((tuple(curr), t))
-            
         return path
 
     def smart_move(self, agv_id, start_pos, target_pos, floor, start_time, w_evt, res_table, astar, is_loaded_mode):
+        # 1. Normal A*
         path, _ = astar.find_path(start_pos, target_pos, start_time, is_loaded=is_loaded_mode)
         if path:
             self.write_move_events(w_evt, path, floor, agv_id, res_table)
             return path[-1][1]
         
+        # 2. Try Clearing Obstacles (if loaded)
         if is_loaded_mode:
-            new_time = self._execute_obstacle_clearing(start_pos, floor, agv_id, start_time, w_evt, res_table, astar, is_carrying_main_shelf=True)
-            path, _ = astar.find_path(start_pos, target_pos, new_time, is_loaded=True)
-            if path:
-                self.write_move_events(w_evt, path, floor, agv_id, res_table)
-                return path[-1][1]
-            else:
-                fb_path = self._generate_fallback_path(start_pos, target_pos, new_time)
-                self.write_move_events(w_evt, fb_path, floor, agv_id, res_table)
-                return fb_path[-1][1]
+            # First try path with ignore_dynamic=True to see if wall-safe path exists
+            path_soft, _ = astar.find_path(start_pos, target_pos, start_time, is_loaded=is_loaded_mode, ignore_dynamic=True)
+            
+            if path_soft:
+                # If a soft path exists, it means we are blocked by dynamic obstacles (AGVs/Shelves).
+                # Trigger clearing logic.
+                new_time = self._execute_obstacle_clearing(start_pos, floor, agv_id, start_time, w_evt, res_table, astar, is_carrying_main_shelf=True)
+                path, _ = astar.find_path(start_pos, target_pos, new_time, is_loaded=True)
+                if path:
+                    self.write_move_events(w_evt, path, floor, agv_id, res_table)
+                    return path[-1][1]
+            
+            # Fallback 1: Use the soft path (ignores reservations, might overlap but won't hit walls)
+            if path_soft:
+                self.write_move_events(w_evt, path_soft, floor, agv_id, res_table)
+                return path_soft[-1][1]
+            
+            # Fallback 2: Manhattan (Last resort, might hit walls)
+            fb_path = self._generate_fallback_path(start_pos, target_pos, start_time)
+            self.write_move_events(w_evt, fb_path, floor, agv_id, res_table)
+            return fb_path[-1][1]
+            
         else:
+            # Empty AGV blocked? Try soft path first
+            path_soft, _ = astar.find_path(start_pos, target_pos, start_time, is_loaded=False, ignore_dynamic=True)
+            if path_soft:
+                self.write_move_events(w_evt, path_soft, floor, agv_id, res_table)
+                return path_soft[-1][1]
+                
             fb_path = self._generate_fallback_path(start_pos, target_pos, start_time)
             self.write_move_events(w_evt, fb_path, floor, agv_id, res_table)
             return fb_path[-1][1]
@@ -543,7 +573,7 @@ class AdvancedSimulationRunner:
         print(f"   -> Effective Orders: {len(self.all_tasks_raw)}")
         start_real = time.time()
         
-        # [V49 Fix] Ensure initial status for ALL stations (1-8, 101-108)
+        # [V50 Fix] Force output initial status for ALL stations (1-8, 101-108)
         for floor in ['2F', '3F']:
             for sid, info in self.stations.items():
                 if info['floor'] == floor:
