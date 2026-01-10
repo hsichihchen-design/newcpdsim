@@ -1,7 +1,7 @@
 import pandas as pd
 import json
 import os
-import numpy as np
+import re
 
 # ---------------- CONFIG ----------------
 BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -41,8 +41,21 @@ def load_shelf_map():
         except: pass
     return shelf_set
 
+# [V41 Fix] 強制正規化 ID，解決 "17" 與 "AGV_17" 分裂的問題
+def normalize_obj_id(val):
+    val = str(val).strip()
+    # 如果是純數字，或者是 AGV 開頭的，全部統一轉為 AGV_X
+    if val.isdigit():
+        return f"AGV_{int(val)}"
+    if val.upper().startswith('AGV'):
+        # 提取數字部分
+        nums = re.findall(r'\d+', val)
+        if nums:
+            return f"AGV_{int(nums[0])}"
+    return val
+
 def main():
-    print("🚀 [Step 5] 啟動視覺化 (V39: UI Split & Data Logic Fix)...")
+    print("🚀 [Step 5] 啟動視覺化 (V41: ID Merge & Ghost Fix)...")
 
     map_2f = load_map_fixed('2F_map.xlsx', 32, 61)
     map_3f = load_map_fixed('3F_map.xlsx', 32, 61)
@@ -59,7 +72,7 @@ def main():
         print(f"❌ Error reading events: {e}")
         return
     
-    # 日期過濾與解析
+    # 1. 時間處理
     df_events['start_ts'] = pd.to_datetime(df_events['start_time'], errors='coerce')
     df_events['end_ts'] = pd.to_datetime(df_events['end_time'], errors='coerce')
     df_events = df_events.dropna(subset=['start_ts', 'end_ts'])
@@ -68,6 +81,10 @@ def main():
     if df_events.empty: 
         print("⚠️ 無有效事件資料")
         return
+
+    # 2. [重要] ID 正規化：合併 Ghost 17 與 Real 17
+    # 凡是能識別出是 AGV 的，統一名稱格式，這樣所有的事件就會歸屬到同一個物件
+    df_events['obj_id'] = df_events['obj_id'].apply(normalize_obj_id)
 
     df_events['start_ts'] = df_events['start_ts'].astype('int64') // 10**9
     df_events['end_ts'] = df_events['end_ts'].astype('int64') // 10**9
@@ -80,19 +97,17 @@ def main():
 
     events_data = df_events[['start_ts', 'end_ts', 'floor', 'obj_id', 'sx', 'sy', 'ex', 'ey', 'type', 'text']].values.tolist()
     
-    # 抓取 AGV ID (只保留數字部分，例如 '16')
-    all_agvs = sorted(list(df_events[df_events['obj_id'].str.contains('AGV')]['obj_id'].unique()))
+    # 抓取 AGV ID (正規化後，現在只會有一組 AGV_17)
+    all_agvs = sorted(list(df_events[df_events['obj_id'].str.startswith('AGV')]['obj_id'].unique()))
     
     # 抓取 Station ID
     all_stations = df_events[df_events['obj_id'].str.startswith('WS_')]['obj_id'].unique().tolist()
     try: all_stations.sort(key=lambda x: int(x.split('_')[1]))
     except: pass
 
-    # --- KPI Processing (Auto-Count Logic) ---
+    # --- KPI Processing ---
     kpi_path = os.path.join(LOG_DIR, 'simulation_kpi.csv')
     kpi_raw = []
-    
-    # 自動統計總量，修復 Step 4 輸出為 0 的問題
     calc_wave_totals = {}
     calc_recv_totals = {}
 
@@ -106,7 +121,6 @@ def main():
         df_kpi['finish_ts'] = df_kpi['finish_ts'].astype('int64') // 10**9
         df_kpi = df_kpi.sort_values('finish_ts')
         
-        # 統計邏輯
         for _, row in df_kpi.iterrows():
             wid = str(row['wave_id'])
             if row['type'] == 'RECEIVING':
@@ -125,7 +139,7 @@ def main():
 <html>
 <head>
     <meta charset="utf-8">
-    <title>Warehouse Monitor V39</title>
+    <title>Warehouse Monitor V41</title>
     <style>
         body { font-family: 'Segoe UI', sans-serif; margin: 0; display: flex; flex-direction: column; height: 100vh; overflow: hidden; background: #eef1f5; }
         .header { background: #fff; height: 40px; padding: 0 20px; display: flex; align-items: center; border-bottom: 1px solid #ddd; flex-shrink: 0; }
@@ -145,7 +159,6 @@ def main():
         .wave-item { font-size:11px; margin-bottom:5px; background:#fff; padding:5px; border:1px solid #ddd; }
         .progress-bg { height:6px; background:#eee; margin-top:2px; border-radius:3px; overflow:hidden; }
         .progress-fill { height:100%; transition:width 0.3s; }
-        .warn-text { color: #dc3545; font-weight:bold; margin-left: 5px; font-size: 10px; }
         .controls { padding: 10px; background: #fff; border-top: 1px solid #ddd; display: flex; gap: 10px; align-items: center; }
         .legend { display: flex; gap: 10px; font-size: 11px; margin-bottom: 5px; flex-wrap: wrap; }
         .box { width: 12px; height: 12px; margin-right: 3px; border: 1px solid #666; }
@@ -154,7 +167,7 @@ def main():
 </head>
 <body>
     <div class="header">
-        <h3>🏭 倉儲戰情室 (V39: UI Split & Fix)</h3>
+        <h3>🏭 倉儲戰情室 (V41: ID Cleaned)</h3>
         <div style="flex:1"></div>
         <span id="timeDisplay" style="font-weight: bold;">--</span>
     </div>
@@ -165,8 +178,7 @@ def main():
                 <div style="display:flex;align-items:center"><div class="box" style="border-radius:50%;background:#00e5ff;border:1px solid #000"></div>AGV(空)</div>
                 <div style="display:flex;align-items:center"><div class="box" style="background:#d500f9;border:1px solid #fff"></div>AGV(載貨)</div>
                 <div style="display:flex;align-items:center"><div class="box" style="background:orange"></div>讓路</div>
-                <div style="display:flex;align-items:center"><div class="box" style="background:purple"></div>移庫</div>
-                <div style="display:flex;align-items:center"><div class="box" style="background:red"></div>瞬移</div>
+                <div style="display:flex;align-items:center"><div class="box" style="background:red"></div>瞬移/警告</div>
             </div>
             <div class="floor-container">
                 <div class="floor-label">2F Map</div>
@@ -221,8 +233,6 @@ def main():
     const kpiRaw = __KPI_RAW__;
     const agvIds = __AGV_IDS__;
     const stIds = __STATION_IDS__;
-    
-    // [V39] Calculated Totals
     const waveTotals = __WAVE_TOTALS__;
     const recvTotals = __RECV_TOTALS__;
     
@@ -237,9 +247,11 @@ def main():
 
     const initialShelfSets = { '2F': new Set(shelfData['2F']), '3F': new Set(shelfData['3F']) };
     
-    // [V39] Logic Fix: Loaded state persistence
     let agvState = {};
-    agvIds.forEach(id => { agvState[id] = { floor: '2F', x: -1, y: -1, visible: false, color: '#00e5ff', loaded: false }; });
+    agvIds.forEach(id => { 
+        agvState[id] = { floor: '2F', x: -1, y: -1, visible: false, color: '#00e5ff', loaded: false }; 
+    });
+    
     let tempObjects = []; 
     let stState = {};
     stIds.forEach(id => { 
@@ -305,24 +317,33 @@ def main():
 
     let currTime = minTime;
     let isPlaying = false;
-    let lastFrameTime = 0;
-
-    const slider = document.getElementById('slider');
 
     function updateState(time) {
         currentShelves['2F'] = new Set(initialShelfSets['2F']);
         currentShelves['3F'] = new Set(initialShelfSets['3F']);
         tempObjects = [];
         
+        agvIds.forEach(id => { 
+            agvState[id].visible = false; 
+            agvState[id].loaded = false; 
+            agvState[id].color = '#00e5ff';
+        });
+        
+        // Chronological Replay with ID Merged Events
         for(let i=0; i<events.length; i++) {
             const e = events[i];
-            if (e[0] > time) break; 
+            const startT = e[0];
+            const endT = e[1];
+            
+            if (startT > time) break;
+            
+            // --- SHELF LOGIC ---
             if (e[8] === 'SHELF_LOAD' || e[8] === 'SHUFFLE') { 
                 const key = e[4] + "," + e[5];
                 currentShelves[e[2]].delete(key);
             } 
             if (e[8] === 'SHELF_UNLOAD' || e[8] === 'SHUFFLE') { 
-                if(e[8] === 'SHUFFLE' && e[1] <= time) {
+                if(e[8] === 'SHUFFLE') {
                     const key = e[6] + "," + e[7];
                     currentShelves[e[2]].add(key);
                 } else if(e[8] === 'SHELF_UNLOAD') {
@@ -330,44 +351,22 @@ def main():
                     currentShelves[e[2]].add(key);
                 }
             }
-        }
 
-        agvIds.forEach(id => { agvState[id].visible = false; agvState[id].loaded = false; });
-
-        for(let i=events.length-1; i>=0; i--) {
-            const e = events[i];
-            
-            // [V39 Fix] Improved Loaded State Logic
-            // If an event is 'SHELF_LOAD' and happened before now, AGV is loaded
-            // UNLESS a subsequent 'SHELF_UNLOAD' also happened before now
-            if (e[3].startsWith('AGV') && e[0] <= time) {
+            // --- AGV LOGIC ---
+            if (e[3].startsWith('AGV')) {
                 const id = e[3];
-                if (e[8] === 'SHELF_LOAD') {
-                    // Check if there is a corresponding UNLOAD in the future (relative to event, but before now)
-                    let hasUnloaded = false;
-                    for(let k=i+1; k<events.length; k++) {
-                        const nextE = events[k];
-                        if (nextE[0] > time) break; // Future event relative to NOW
-                        if (nextE[3] === id && nextE[8] === 'SHELF_UNLOAD') {
-                            hasUnloaded = true;
-                            break;
-                        }
-                    }
-                    if (!hasUnloaded) agvState[id].loaded = true;
-                }
-            }
-
-            if (e[0] <= time && e[1] >= time) {
-                const p = (time - e[0]) / (e[1] - e[0]);
-                const curX = e[4]+(e[6]-e[4])*p;
-                const curY = e[5]+(e[7]-e[5])*p;
+                // History Replay
+                if (e[8] === 'SHELF_LOAD') agvState[id].loaded = true;
+                if (e[8] === 'SHELF_UNLOAD') agvState[id].loaded = false;
                 
-                if (e[3].startsWith('AGV')) {
-                    const id = e[3];
-                    if (agvState[id]) {
-                        agvState[id].floor = e[2];
-                        agvState[id].x = curX; agvState[id].y = curY;
-                        agvState[id].visible = true;
+                if (time >= startT) {
+                    agvState[id].floor = e[2];
+                    agvState[id].visible = true;
+                    
+                    if (time <= endT && endT > startT) {
+                        const p = (time - startT) / (endT - startT);
+                        agvState[id].x = e[4] + (e[6] - e[4]) * p;
+                        agvState[id].y = e[5] + (e[7] - e[5]) * p;
                         
                         if (e[8] === 'NUDGE' || e[8] === 'YIELD') agvState[id].color = 'orange';
                         else if (e[8] === 'PARKING') agvState[id].color = 'green';
@@ -375,19 +374,18 @@ def main():
                         else {
                             agvState[id].color = agvState[id].loaded ? '#d500f9' : '#00e5ff';
                         }
+                    } else {
+                        // Finished event - hold position
+                        agvState[id].x = e[6];
+                        agvState[id].y = e[7];
+                        agvState[id].color = agvState[id].loaded ? '#d500f9' : '#00e5ff';
                     }
-                } else if (e[8] === 'SHUFFLE') {
-                    tempObjects.push({ floor: e[2], x: curX, y: curY, color: 'purple' });
                 }
             }
-        }
-        
-        Object.keys(stState).forEach(sid => { stState[sid].status = 'IDLE'; stState[sid].color = 'WHITE'; });
-        for(let i=0; i<events.length; i++) {
-            const e = events[i];
+            
+            // --- STATION LOGIC ---
             if (e[8] === 'STATION_STATUS') {
-                if (e[0] > time) break;
-                if (e[1] >= time) {
+                if (time >= startT && time < endT) {
                     const sid = e[3];
                     if(stState[sid]) {
                         const parts = e[9].split('|');
@@ -397,6 +395,13 @@ def main():
                     }
                 }
             }
+            
+            if (e[8] === 'SHUFFLE' && time >= startT && time <= endT) {
+                const p = (time - startT) / (endT - startT);
+                const cx = e[4] + (e[6] - e[4]) * p;
+                const cy = e[5] + (e[7] - e[5]) * p;
+                tempObjects.push({ floor: e[2], x: cx, y: cy, color: 'purple' });
+            }
         }
     }
 
@@ -405,9 +410,11 @@ def main():
         drawMap(f2, '2F');
         drawMap(f3, '3F');
         
+        let activeCount = 0;
         Object.keys(agvState).forEach(id => {
             const s = agvState[id];
             if (!s.visible) return;
+            activeCount++;
             const obj = s.floor == '2F' ? f2 : f3;
             if(!obj.map) return;
             const sz = obj.size;
@@ -418,23 +425,24 @@ def main():
             obj.ctx.beginPath();
             obj.ctx.arc(px, py, sz/2.1, 0, Math.PI*2);
             obj.ctx.fill();
-            obj.ctx.strokeStyle = '#333';
-            obj.ctx.lineWidth = 1;
-            obj.ctx.stroke();
+            obj.ctx.strokeStyle = '#333'; obj.ctx.lineWidth = 1; obj.ctx.stroke();
             
             if (s.loaded && !['red','orange','green'].includes(s.color)) {
                 obj.ctx.fillStyle = '#fff';
                 obj.ctx.fillRect(px-sz/4, py-sz/4, sz/2, sz/2);
             }
 
+            // [V41 Fix] 僅顯示數字，移除 AGV_ 前綴
             if (sz > 8) {
-                obj.ctx.fillStyle = 'black'; obj.ctx.font = 'bold 10px Arial';
+                obj.ctx.fillStyle = 'black'; 
+                obj.ctx.font = 'bold 10px Arial';
                 obj.ctx.textAlign = 'center';
-                // [V39 Fix] Only number
-                obj.ctx.fillText(id.replace('AGV_',''), px, py+4);
+                const label = id.replace('AGV_', '');
+                obj.ctx.fillText(label, px, py+4);
             }
         });
-        
+        document.getElementById('val-active').innerText = activeCount;
+
         tempObjects.forEach(o => {
             const obj = o.floor == '2F' ? f2 : f3;
             if(!obj.map) return;
@@ -445,18 +453,19 @@ def main():
             obj.ctx.fillRect(px+2, py+2, sz-4, sz-4);
         });
         
-        // Draw Station Grid UI (Split)
+        // Stations
         let h2 = '', h3 = '';
         stIds.forEach(sid => {
             const s = stState[sid];
             const color = s.color === 'BLUE' ? '#007bff' : s.color === 'GREEN' ? '#28a745' : '#ddd';
-            const card = `<div class="station-card"><div style="font-weight:bold">${sid.replace('WS_','')}</div><div style="margin-top:2px"><span class="status-dot" style="background:${color}"></span>${s.wave}</div></div>`;
+            const label = sid.replace('WS_','');
+            const card = `<div class="station-card"><div style="font-weight:bold">${label}</div><div style="margin-top:2px"><span class="status-dot" style="background:${color}"></span>${s.wave}</div></div>`;
             if (s.floor === '2F') h2 += card; else h3 += card;
         });
         document.getElementById('st-list-2f').innerHTML = h2 || 'No Data';
         document.getElementById('st-list-3f').innerHTML = h3 || 'No Data';
 
-        // KPI Dashboard
+        // KPI
         const doneTasks = kpiRaw.filter(k => k[0] <= currTime);
         document.getElementById('val-done').innerText = doneTasks.length;
         
@@ -464,6 +473,7 @@ def main():
         document.getElementById('timeDisplay').innerText = dObj.toLocaleString();
         document.getElementById('slider').value = currTime;
         
+        // Progress Bars
         const waveProgress = {};
         const recvProgress = {};
         let totalDelay = 0;
@@ -477,14 +487,11 @@ def main():
         });
         document.getElementById('val-delay').innerText = totalDelay;
 
-        // Render Wave List
         let wHtml = '';
         const activeWaves = Object.keys(waveTotals).sort(); 
-        
         activeWaves.forEach(wid => {
             const total = waveTotals[wid];
             const done = waveProgress[wid] || 0;
-            // Only show relevant
             if (done < total || (done >= total && doneTasks.some(k=>k[2]==wid && k[0] > currTime - 1800))) {
                 const pct = Math.min(100, (done/total*100)).toFixed(0);
                 wHtml += `<div class="wave-item"><div style="display:flex;justify-content:space-between"><span>${wid}</span><span>${done}/${total}</span></div><div class="progress-bg"><div class="progress-fill" style="width:${pct}%;background:#007bff"></div></div></div>`;
@@ -492,10 +499,8 @@ def main():
         });
         document.getElementById('wave-list').innerHTML = wHtml || '<div style="color:#999;padding:5px">No Active Waves</div>';
         
-        // Render Inbound List
         let rHtml = '';
         const todayStr = `${dObj.getFullYear()}-${String(dObj.getMonth()+1).padStart(2,'0')}-${String(dObj.getDate()).padStart(2,'0')}`;
-        
         if (recvTotals[todayStr]) {
              const total = recvTotals[todayStr];
              const done = recvProgress[todayStr] || 0;
@@ -546,7 +551,7 @@ def main():
 
     with open(OUTPUT_HTML, 'w', encoding='utf-8') as f:
         f.write(final_html)
-    print(f"✅ 視覺化生成完畢: {OUTPUT_HTML} (V39 Auto-Count)")
+    print(f"✅ 視覺化生成完畢: {OUTPUT_HTML} (V41: Ghosts Busted)")
 
 if __name__ == "__main__":
     main()
