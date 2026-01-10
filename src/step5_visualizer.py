@@ -40,7 +40,7 @@ def load_shelf_map():
     return shelf_set
 
 def main():
-    print("🚀 [Step 5] 啟動視覺化 (V31: Dynamic Shelves & Square AGVs)...")
+    print("🚀 [Step 5] 啟動視覺化 (V32: KPI Robust Reader)...")
 
     map_2f = load_map_fixed('2F_map.xlsx', 32, 61)
     map_3f = load_map_fixed('3F_map.xlsx', 32, 61)
@@ -85,37 +85,50 @@ def main():
     try: all_stations.sort(key=lambda x: int(x.split('_')[1]))
     except: pass
 
-    # KPI 讀取 (略，保持原樣)
     kpi_path = os.path.join(LOG_DIR, 'simulation_kpi.csv')
     kpi_raw = []
-    recv_totals_simple = {}
-    wave_totals_simple = {}
-    wave_deadlines = {}
     
+    wave_deadlines = {} 
+    wave_totals_simple = {} 
+    recv_totals_simple = {} 
+
     try:
-        try: df_kpi = pd.read_csv(kpi_path, on_bad_lines='skip', engine='python')
-        except: df_kpi = pd.read_csv(kpi_path, error_bad_lines=False, engine='python')
+        try:
+            df_kpi = pd.read_csv(kpi_path, on_bad_lines='skip', engine='python')
+        except:
+            df_kpi = pd.read_csv(kpi_path, error_bad_lines=False, engine='python')
+
+        # [Fix] 增強日期讀取，處理可能的格式問題
         df_kpi['finish_ts'] = pd.to_datetime(df_kpi['finish_time'], errors='coerce')
         df_kpi = df_kpi.dropna(subset=['finish_ts'])
         df_kpi['date'] = df_kpi['finish_ts'].dt.strftime('%Y-%m-%d')
         df_kpi['finish_ts'] = df_kpi['finish_ts'].astype('int64') // 10**9
+        df_kpi = df_kpi.sort_values('finish_ts')
+        
+        if 'total_in_wave' not in df_kpi.columns: df_kpi['total_in_wave'] = 0
+        if 'deadline_ts' not in df_kpi.columns: df_kpi['deadline_ts'] = 0
+        
         kpi_raw = df_kpi[['finish_ts', 'type', 'wave_id', 'is_delayed', 'date', 'workstation', 'total_in_wave', 'deadline_ts']].values.tolist()
+        
         for _, row in df_kpi.iterrows():
             total = int(row['total_in_wave'])
             wid = str(row['wave_id'])
-            if row['type'] == 'RECEIVING': 
+            deadline = int(row['deadline_ts'])
+            if deadline > 0: wave_deadlines[wid] = deadline
+            if row['type'] == 'RECEIVING':
                 d = row['date']
                 if total > recv_totals_simple.get(d, 0): recv_totals_simple[d] = total
             else:
                 if total > wave_totals_simple.get(wid, 0): wave_totals_simple[wid] = total
-    except: pass
+    except Exception as e: 
+        print(f"⚠️ KPI Error: {e}")
 
     html_template = """
 <!DOCTYPE html>
 <html>
 <head>
     <meta charset="utf-8">
-    <title>Warehouse Monitor V31</title>
+    <title>Warehouse Monitor V32</title>
     <style>
         body { font-family: 'Segoe UI', sans-serif; margin: 0; display: flex; flex-direction: column; height: 100vh; overflow: hidden; background: #eef1f5; }
         .header { background: #fff; height: 40px; padding: 0 20px; display: flex; align-items: center; border-bottom: 1px solid #ddd; flex-shrink: 0; }
@@ -148,7 +161,7 @@ def main():
 </head>
 <body>
     <div class="header">
-        <h3>🏭 倉儲戰情室 (V31)</h3>
+        <h3>🏭 倉儲戰情室 (V32)</h3>
         <div style="flex:1"></div>
         <span id="timeDisplay" style="font-weight: bold;">--</span>
     </div>
@@ -394,6 +407,14 @@ def main():
         }
     }
 
+    function getLocalYMD(ts) {
+        const d = new Date(ts * 1000);
+        const y = d.getFullYear();
+        const m = String(d.getMonth()+1).padStart(2,'0');
+        const day = String(d.getDate()).padStart(2,'0');
+        return `${y}-${m}-${day}`;
+    }
+
     function render() {
         updateState(currTime);
         drawMap(f2, '2F');
@@ -422,23 +443,93 @@ def main():
             }
             activeCount++;
         });
-        // ... (Rest of UI updates) ...
         document.getElementById('val-active').innerText = activeCount;
-        // (KPI updates omitted for brevity, same as previous)
+        
+        let html2 = '', html3 = '';
+        stIds.forEach(sid => {
+            const s = stState[sid];
+            const color = s.color === 'BLUE' ? '#007bff' : s.color === 'GREEN' ? '#28a745' : s.color === 'ORANGE' ? '#fd7e14' : 'rgba(255,255,255,0.7)';
+            const delayHtml = s.delay ? '<div class="delay-badge">DELAY</div>' : '';
+            const card = `<div class="station-card"><div style="font-weight:bold;display:flex;justify-content:space-between;width:100%">${sid.replace('WS_','')} ${delayHtml}</div><div style="margin-top:2px"><span class="status-dot" style="background:${color}"></span>${s.status}</div><div class="st-wave" title="${s.wave}">${s.wave}</div></div>`;
+            if (s.floor === '2F') html2 += card; else html3 += card;
+        });
+        document.getElementById('st-list-2f').innerHTML = html2 || 'No Data';
+        document.getElementById('st-list-3f').innerHTML = html3 || 'No Data';
+
         const doneTasks = kpiRaw.filter(k => k[0] <= currTime);
         document.getElementById('val-done').innerText = doneTasks.length;
         document.getElementById('timeDisplay').innerText = new Date(currTime*1000).toLocaleString();
         document.getElementById('slider').value = currTime;
         
-        // ... (Wave list updates same as previous) ...
+        let delayIn = 0;
+        let delayOut = 0;
+        const doneRecv = {};
+        const doneByWave = {};
+
+        doneTasks.forEach(k => {
+            const wid = k[2], type = k[1], isD = k[3], date = k[4];
+            if(type === 'RECEIVING') {
+                doneRecv[date] = (doneRecv[date] || 0) + 1;
+                if(isD === 'Y') delayIn++;
+            } else {
+                doneByWave[wid] = (doneByWave[wid] || 0) + 1;
+                if(isD === 'Y') delayOut++;
+            }
+        });
+        
+        document.getElementById('val-delay-in').innerText = delayIn;
+        document.getElementById('val-delay-out').innerText = delayOut;
+        
         const waveInfoLive = {}, recvInfoLive = {};
         for(let d in serverRecvTotals) recvInfoLive[d] = {total: serverRecvTotals[d]};
         for(let w in serverWaveTotals) waveInfoLive[w] = {total: serverWaveTotals[w]};
         
-        // ... (Recalculate progress bars) ...
+        kpiRaw.forEach(k => {
+            const wid = k[2], type = k[1], date = k[4], total = k[6];
+            if(type === 'RECEIVING') {
+                if(!recvInfoLive[date]) recvInfoLive[date] = {total: 0};
+                if(total > recvInfoLive[date].total) recvInfoLive[date].total = total;
+            } else {
+                if(!waveInfoLive[wid]) waveInfoLive[wid] = {total: 0};
+                if(total > waveInfoLive[wid].total) waveInfoLive[wid].total = total;
+            }
+        });
+
         let wHtml = '';
-        // ... (Generate wave HTML) ...
+        Object.keys(waveInfoLive).sort().forEach(wid => {
+            const info = waveInfoLive[wid];
+            const done = doneByWave[wid] || 0;
+            const total = info.total || 1;
+            const deadline = serverWaveDeadlines[wid] || 0;
+            const isLateNow = (deadline > 0 && currTime > deadline && done < total);
+            
+            let delayTxt = '';
+            if (isLateNow) {
+                const diffMins = Math.floor((currTime - deadline) / 60);
+                delayTxt = `<span class="warn-text">Delay ${diffMins}m</span>`;
+            }
+            
+            if (total > 0) {
+                const isDone = done >= total;
+                const pct = (done/total*100).toFixed(0);
+                const barColor = isLateNow ? '#dc3545' : (isDone ? '#28a745' : '#007bff');
+                const warn = isLateNow ? '<span class="warn-tag">DELAY</span>' : '';
+                wHtml += `<div class="wave-item"><div style="display:flex;justify-content:space-between"><span>${wid} ${warn} ${delayTxt}</span><span>${done}/${total}</span></div><div class="progress-bg"><div class="progress-fill" style="width:${pct}%;background:${barColor}"></div></div></div>`;
+            }
+        });
         document.getElementById('wave-list').innerHTML = wHtml || '<div style="color:#999;padding:5px">Waiting...</div>';
+        
+        let rHtml = '';
+        const todayStr = getLocalYMD(currTime);
+        if (recvInfoLive[todayStr]) {
+            const info = recvInfoLive[todayStr];
+            const done = doneRecv[todayStr] || 0;
+            const pct = info.total > 0 ? (done/info.total*100).toFixed(0) : 0;
+            rHtml = `<div class="wave-item"><div style="display:flex;justify-content:space-between"><span>📅 ${todayStr}</span><span>${done}/${info.total}</span></div><div class="progress-bg"><div class="progress-fill" style="width:${pct}%;background:#28a745"></div></div></div>`;
+        } else {
+            rHtml = `<div style="color:#999;padding:5px">No receiving orders on ${todayStr}</div>`;
+        }
+        document.getElementById('recv-list').innerHTML = rHtml;
     }
 
     function animate() {
