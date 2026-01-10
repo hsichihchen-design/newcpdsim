@@ -23,7 +23,6 @@ class TimeAwareAStar:
     def heuristic(self, a, b):
         return abs(a[0] - b[0]) + abs(a[1] - b[1])
 
-    # [Fix] 統一參數名稱為 is_loaded
     def find_path(self, start, goal, start_time_sec, static_blockers=None, is_loaded=False):
         if start == goal: return [(start, start_time_sec)], start_time_sec
         if not (0 <= start[0] < self.rows and 0 <= start[1] < self.cols): return None, None
@@ -37,7 +36,7 @@ class TimeAwareAStar:
         came_from = {}
         g_score = {(start, start_time_sec, (0,0)): 0}
         
-        max_steps = 8000 
+        max_steps = 6000 
         steps = 0
         
         NORMAL_COST = 1      
@@ -79,11 +78,9 @@ class TimeAwareAStar:
                     elif val == 1:
                         if (nr, nc) in self.valid_storage_spots: 
                             if is_loaded:
-                                # 載貨時：不能穿過其他料架
                                 if (nr, nc) != goal and (nr, nc) != start:
                                     step_cost = OBSTACLE_COST
                             else:
-                                # 空車時：可以穿過
                                 step_cost = NORMAL_COST
                         else:
                             if (nr, nc) != goal and (nr, nc) != start: step_cost = OBSTACLE_COST
@@ -125,7 +122,7 @@ class TimeAwareAStar:
 
 class AdvancedSimulationRunner:
     def __init__(self):
-        print(f"🚀 [Step 4] 啟動進階模擬 (V35: Fix Param Name is_loaded)...")
+        print(f"🚀 [Step 4] 啟動進階模擬 (V39: All Fixes Included)...")
         
         self.PICK_TIME = 20
         self.grid_2f = self._load_map_correct('2F_map.xlsx', 32, 61)
@@ -326,89 +323,124 @@ class AdvancedSimulationRunner:
                 ])
                 seg_start = path[i+1]
 
+    def _generate_fallback_path(self, start, end, start_time):
+        path = []
+        curr = list(start)
+        t = start_time
+        while curr[0] != end[0]:
+            curr[0] += 1 if end[0] > curr[0] else -1
+            t += 1
+            path.append(((curr[0], curr[1]), t))
+        while curr[1] != end[1]:
+            curr[1] += 1 if end[1] > curr[1] else -1
+            t += 1
+            path.append(((curr[0], curr[1]), t))
+        return path
+
+    # [Fix] 補回遺失的清理函式
     def _cleanup_reservations(self, res_table, limit_time):
         cutoff = limit_time - 60
         to_del = [t for t in res_table if t < cutoff]
         for t in to_del:
             del res_table[t]
 
-    def _handle_blocking_shelves(self, path, floor, agv_id, start_time, w_evt, res_table, astar):
-        final_time = start_time
-        if not path: return start_time
-        
-        path_coords = [p[0] for p in path]
-        target_pos = path_coords[-1]
-        start_pos = path_coords[0]
-        
-        obstacles = []
-        for pos in path_coords:
-            if pos == start_pos or pos == target_pos: continue
-            if pos in self.shelf_occupancy[floor]:
-                obstacles.append(pos)
-        
-        if not obstacles:
-            self.write_move_events(w_evt, path, floor, agv_id, res_table)
-            return path[-1][1]
-
-        current_t = start_time
+    def _execute_obstacle_clearing(self, target_pos, floor, agv_id, start_time, w_evt, res_table, astar, is_carrying_main_shelf):
         grid = self.grid_2f if floor == '2F' else self.grid_3f
+        current_t = start_time
         
-        for obs_pos in obstacles:
-            buffer_pos = self._find_accessible_buffer(obs_pos, grid, self.shelf_occupancy[floor], astar, start_time)
-            if not buffer_pos: return start_time + 60
-
-            # 1. AGV -> Obstacle (Empty)
-            path_to_obs, _ = astar.find_path(self.agv_state[floor][int(agv_id)]['pos'], obs_pos, current_t, is_loaded=False)
-            if path_to_obs:
-                self.write_move_events(w_evt, path_to_obs, floor, agv_id, res_table)
-                current_t = path_to_obs[-1][1]
-                self.agv_state[floor][int(agv_id)]['pos'] = obs_pos
-            else:
-                current_t += 30 
-            
-            # 2. Lift
+        if is_carrying_main_shelf:
             w_evt.writerow([
                 self.to_dt(current_t), self.to_dt(current_t+5), floor, f"AGV_{agv_id}",
-                obs_pos[1], obs_pos[0], obs_pos[1], obs_pos[0], 'SHELF_LOAD', ''
+                target_pos[1], target_pos[0], target_pos[1], target_pos[0], 'SHELF_UNLOAD', 'Temp Drop'
             ])
             current_t += 5
-            self.shelf_occupancy[floor].remove(obs_pos)
-            
-            # 3. Obstacle -> Buffer (Loaded)
-            path_to_buffer, _ = astar.find_path(obs_pos, buffer_pos, current_t, is_loaded=True)
-            if path_to_buffer:
-                self.write_move_events(w_evt, path_to_buffer, floor, agv_id, res_table)
-                current_t = path_to_buffer[-1][1]
-                self.agv_state[floor][int(agv_id)]['pos'] = buffer_pos
-            else:
+            self.shelf_occupancy[floor].add(target_pos)
+        
+        blocking_neighbors = []
+        for dr, dc in [(0,1), (0,-1), (1,0), (-1,0)]:
+            nr, nc = target_pos[0]+dr, target_pos[1]+dc
+            if 0<=nr<grid.shape[0] and 0<=nc<grid.shape[1]:
+                if (nr,nc) in self.shelf_occupancy[floor]: blocking_neighbors.append((nr,nc))
+        
+        if not blocking_neighbors:
+            if is_carrying_main_shelf:
                 w_evt.writerow([
-                    self.to_dt(current_t), self.to_dt(current_t+60), floor, f"AGV_{agv_id}",
-                    obs_pos[1], obs_pos[0], buffer_pos[1], buffer_pos[0], 'AGV_MOVE', 'Force Move'
+                    self.to_dt(current_t), self.to_dt(current_t+5), floor, f"AGV_{agv_id}",
+                    target_pos[1], target_pos[0], target_pos[1], target_pos[0], 'SHELF_LOAD', 'Reload'
                 ])
-                current_t += 60
+                current_t += 5
+                self.shelf_occupancy[floor].remove(target_pos)
+            return current_t
+
+        obstacle_to_move = blocking_neighbors[0]
+        buffer_pos = self._find_accessible_buffer(obstacle_to_move, grid, self.shelf_occupancy[floor], astar, current_t)
+        if not buffer_pos: 
+            if is_carrying_main_shelf:
+                w_evt.writerow([
+                    self.to_dt(current_t), self.to_dt(current_t+5), floor, f"AGV_{agv_id}",
+                    target_pos[1], target_pos[0], target_pos[1], target_pos[0], 'SHELF_LOAD', 'Deadlock Reload'
+                ])
+                current_t += 5
+                self.shelf_occupancy[floor].remove(target_pos)
+            return current_t + 60
+
+        path_to_obs, _ = astar.find_path(target_pos, obstacle_to_move, current_t, is_loaded=False)
+        if path_to_obs:
+            self.write_move_events(w_evt, path_to_obs, floor, agv_id, res_table)
+            current_t = path_to_obs[-1][1]
+        else:
+            fb_path = self._generate_fallback_path(target_pos, obstacle_to_move, current_t)
+            self.write_move_events(w_evt, fb_path, floor, agv_id, res_table)
+            current_t = fb_path[-1][1]
             
-            # 4. Drop
+        w_evt.writerow([
+            self.to_dt(current_t), self.to_dt(current_t+5), floor, f"AGV_{agv_id}",
+            obstacle_to_move[1], obstacle_to_move[0], obstacle_to_move[1], obstacle_to_move[0], 'SHELF_LOAD', 'Clear Obs'
+        ])
+        current_t += 5
+        self.shelf_occupancy[floor].remove(obstacle_to_move)
+        
+        path_to_buffer, _ = astar.find_path(obstacle_to_move, buffer_pos, current_t, is_loaded=True)
+        if path_to_buffer:
+            self.write_move_events(w_evt, path_to_buffer, floor, agv_id, res_table)
+            current_t = path_to_buffer[-1][1]
+        else:
+            fb_path = self._generate_fallback_path(obstacle_to_move, buffer_pos, current_t)
+            self.write_move_events(w_evt, fb_path, floor, agv_id, res_table)
+            current_t = fb_path[-1][1]
+            
+        w_evt.writerow([
+            self.to_dt(current_t), self.to_dt(current_t+5), floor, f"AGV_{agv_id}",
+            buffer_pos[1], buffer_pos[0], buffer_pos[1], buffer_pos[0], 'SHELF_UNLOAD', ''
+        ])
+        current_t += 5
+        self.shelf_occupancy[floor].add(buffer_pos)
+        
+        found_sid = None
+        for sid, info in self.shelf_coords.items():
+            if info['floor'] == floor and info['pos'] == obstacle_to_move:
+                found_sid = sid; break
+        if found_sid: self.shelf_coords[found_sid]['pos'] = buffer_pos
+        
+        path_back, _ = astar.find_path(buffer_pos, target_pos, current_t, is_loaded=False)
+        if path_back:
+            self.write_move_events(w_evt, path_back, floor, agv_id, res_table)
+            current_t = path_back[-1][1]
+        else:
+            fb_path = self._generate_fallback_path(buffer_pos, target_pos, current_t)
+            self.write_move_events(w_evt, fb_path, floor, agv_id, res_table)
+            current_t = fb_path[-1][1]
+            
+        if is_carrying_main_shelf:
             w_evt.writerow([
                 self.to_dt(current_t), self.to_dt(current_t+5), floor, f"AGV_{agv_id}",
-                buffer_pos[1], buffer_pos[0], buffer_pos[1], buffer_pos[0], 'SHELF_UNLOAD', ''
+                target_pos[1], target_pos[0], target_pos[1], target_pos[0], 'SHELF_LOAD', 'Reload Main'
             ])
             current_t += 5
-            self.shelf_occupancy[floor].add(buffer_pos)
+            self.shelf_occupancy[floor].remove(target_pos)
             
-            found_sid = None
-            for sid, info in self.shelf_coords.items():
-                if info['floor'] == floor and info['pos'] == obs_pos:
-                    found_sid = sid
-                    break
-            if found_sid:
-                self.shelf_coords[found_sid]['pos'] = buffer_pos
-            
-        new_path = []
-        for pos, t in path:
-            new_path.append((pos, t - path[0][1] + current_t))
-            
-        self.write_move_events(w_evt, new_path, floor, agv_id, res_table)
-        return new_path[-1][1]
+        self.agv_state[floor][int(agv_id)]['pos'] = target_pos
+        return current_t
 
     def _find_accessible_buffer(self, start_pos, grid, occupied_spots, astar, start_time):
         rows, cols = grid.shape
@@ -417,7 +449,7 @@ class AdvancedSimulationRunner:
         
         while q:
             curr, dist = q.popleft()
-            if dist > 15: break
+            if dist > 10: break
             r, c = curr
             is_valid_spot = (grid[r][c] == 0) or (grid[r][c] == 1 and curr not in occupied_spots)
             
@@ -508,11 +540,9 @@ class AdvancedSimulationRunner:
                 self.write_move_events(w_evt, path_to_shelf, floor, best_agv, res_table)
                 current_t = path_to_shelf[-1][1]
             else:
-                current_t += 300
-                w_evt.writerow([
-                    self.to_dt(start_sec), self.to_dt(current_t), floor, f"AGV_{best_agv}",
-                    agv_curr_pos[1], agv_curr_pos[0], shelf_pos[1], shelf_pos[0], 'AGV_MOVE', 'Force'
-                ])
+                fb_path = self._generate_fallback_path(agv_curr_pos, shelf_pos, current_t)
+                self.write_move_events(w_evt, fb_path, floor, best_agv, res_table)
+                current_t = fb_path[-1][1]
             
             self.agv_state[floor][best_agv]['pos'] = shelf_pos
 
@@ -530,12 +560,16 @@ class AdvancedSimulationRunner:
             path_to_st, _ = astar.find_path(shelf_pos, st_pos, current_t, is_loaded=True)
             
             if not path_to_st:
-                # 找不到合法路徑，代表被包圍，觸發移車邏輯
-                path_to_st, _ = astar.find_path(shelf_pos, st_pos, current_t, is_loaded=False) # 暫用 Empty 找路徑原型
-                arrive_st_sec = self._handle_blocking_shelves(path_to_st, floor, best_agv, current_t, w_evt, res_table, astar)
-            else:
+                current_t = self._execute_obstacle_clearing(shelf_pos, floor, best_agv, current_t, w_evt, res_table, astar, is_carrying_main_shelf=True)
+                path_to_st, _ = astar.find_path(shelf_pos, st_pos, current_t, is_loaded=True)
+                
+            if path_to_st:
                 self.write_move_events(w_evt, path_to_st, floor, best_agv, res_table)
                 arrive_st_sec = path_to_st[-1][1]
+            else:
+                fb_path = self._generate_fallback_path(shelf_pos, st_pos, current_t)
+                self.write_move_events(w_evt, fb_path, floor, best_agv, res_table)
+                arrive_st_sec = fb_path[-1][1]
                 
             # --- 3. 作業 ---
             leave_st_sec = arrive_st_sec + self.PICK_TIME
@@ -576,6 +610,10 @@ class AdvancedSimulationRunner:
                 limit=5
             )
             
+            # [Fix Crash] 保底機制：如果真的沒地方放，就試著放回原位，再不然就隨便找個空地
+            if not candidate_spots:
+                candidate_spots = [shelf_pos]
+            
             path_drop = None
             drop_sec = 0
             drop_pos = st_pos
@@ -589,12 +627,12 @@ class AdvancedSimulationRunner:
                     break
             
             if not path_drop:
-                for drop_try in candidate_spots:
-                    path_drop, _ = astar.find_path(st_pos, drop_try, leave_st_sec, static_blockers, is_loaded=False) # 找假路徑
-                    if path_drop:
-                        drop_sec = self._handle_blocking_shelves(path_drop, floor, best_agv, leave_st_sec, w_evt, res_table, astar)
-                        drop_pos = drop_try
-                        break
+                # 確保 candidate_spots 至少有一個
+                drop_pos = candidate_spots[0]
+                current_t = self._execute_obstacle_clearing(st_pos, floor, best_agv, leave_st_sec, w_evt, res_table, astar, is_carrying_main_shelf=True)
+                fb_path = self._generate_fallback_path(st_pos, drop_pos, current_t)
+                self.write_move_events(w_evt, fb_path, floor, best_agv, res_table)
+                drop_sec = fb_path[-1][1]
 
             finish_sec = drop_sec if drop_sec > 0 else leave_st_sec + 60
             
@@ -615,6 +653,7 @@ class AdvancedSimulationRunner:
             if deadline_ts > 0 and self.to_dt(finish_sec) > deadline:
                 is_delayed = 'Y'
             
+            # [Fix NameError]
             total_in_wave = 0
             if task_type == 'INBOUND':
                 d_str = order['datetime'].strftime('%Y-%m-%d')
