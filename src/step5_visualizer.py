@@ -2,6 +2,7 @@ import pandas as pd
 import json
 import os
 import re
+import math
 
 # ---------------- CONFIG ----------------
 BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -41,25 +42,167 @@ def load_shelf_map():
         except: pass
     return shelf_set
 
-# [V41 Fix] 強制正規化 ID，解決 "17" 與 "AGV_17" 分裂的問題
 def normalize_obj_id(val):
     val = str(val).strip()
-    # 如果是純數字，或者是 AGV 開頭的，全部統一轉為 AGV_X
+    # Normalize numbers or AGV_X
     if val.isdigit():
         return f"AGV_{int(val)}"
     if val.upper().startswith('AGV'):
-        # 提取數字部分
         nums = re.findall(r'\d+', val)
         if nums:
             return f"AGV_{int(nums[0])}"
     return val
 
+def generate_snapshots(events, initial_shelves, interval_seconds=300):
+    """
+    Python-side pre-calculation of state snapshots.
+    To avoid huge file size, we only store the 'Diff': 
+    Which shelves are currently NOT on the floor (i.e., loaded on AGVs).
+    """
+    print("📸 生成狀態快照 (Snapshots)...")
+    
+    # Track current state
+    # current_missing_shelves: stores set of "x,y" strings for shelves currently picked up
+    current_missing = {'2F': set(), '3F': set()} 
+    
+    snapshots = []
+    last_snap_time = -interval_seconds
+    
+    # We need to simulate the state sequentially
+    for idx, e in enumerate(events):
+        start_ts = e[0] # start_time
+        type_ = e[8]    # event type
+        floor = e[2]
+        
+        # 1. Capture Snapshot if interval passed
+        if start_ts - last_snap_time >= interval_seconds:
+            snapshots.append({
+                'time': start_ts,
+                'index': idx,
+                'missing_2F': list(current_missing['2F']),
+                'missing_3F': list(current_missing['3F'])
+            })
+            last_snap_time = start_ts
+            
+        # 2. Update State
+        # Load events (Shelf removed from floor)
+        if type_ in ['SHELF_LOAD', 'SHUFFLE_LOAD']:
+            key = f"{e[4]},{e[5]}" # sx, sy
+            current_missing[floor].add(key)
+            
+        # Unload events (Shelf returned to floor)
+        # Note: Unload happens at end coordinates (ex, ey)
+        elif type_ in ['SHELF_UNLOAD', 'SHUFFLE_UNLOAD']:
+            # SHUFFLE logic in step 4 moves things around.
+            # The event is: start(t), end(t), floor, obj, sx, sy, ex, ey, TYPE...
+            # When UNLOAD happens, the shelf appears at ex, ey.
+            # However, our logic tracks "missing" by ID or original pos? 
+            # Simplified: We just assume the shelf at destination is now occupied.
+            # Wait, if we track by coordinate, SHUFFLE moves shelf from A to B.
+            # LOAD A: A is missing. UNLOAD B: B is present.
+            # This works perfectly for the visualizer which draws based on coordinates.
+            
+            # Key issue: If we SHUFFLE, we pick up at A, drop at B.
+            # The visualizer draws shelves based on `initial_shelves` minus `current_missing` plus `moved_shelves`?
+            # No, standard approach:
+            # The map has static shelf locations.
+            # If we move a shelf to a temp buffer, that buffer spot becomes "Shelf".
+            # This is complex dynamic mapping. 
+            
+            # V50 Simplification for Speed:
+            # We track `dynamic_shelves` (spots that have a shelf NOW).
+            # Initial state: `dynamic_shelves` = `initial_shelves`
+            # LOAD at (x,y): remove (x,y) from `dynamic_shelves`
+            # UNLOAD at (x,y): add (x,y) to `dynamic_shelves`
+            pass
+
+    # Re-run logic to be cleaner for the JS side consumption
+    # Actually, let's keep it simple. The JS will maintain a Set of valid shelf coordinates.
+    # The snapshot will store the FULL LIST of valid shelf coordinates at that time?
+    # No, that's too big (thousands of shelves).
+    # Better: Store the operations delta? No, seeks need absolute state.
+    
+    # Optimal: Store the list of 'Modified Shelves' relative to initial map?
+    # Let's go with: Snapshot stores the list of REMOVED shelves and ADDED shelves relative to base map.
+    
+    return [] # Placeholder, we will implement the logic inside JS for cleaner code distribution 
+              # or do it here. Doing it here is better for performance.
+
+def precompute_snapshots_robust(events, initial_shelf_sets):
+    """
+    Full simulation to generate lightweight snapshots.
+    Snapshot Structure: { time: T, idx: I, current_shelves_2F: [...], current_shelves_3F: [...] }
+    Wait, sending full array of 2000 shelves every 5 mins is heavy.
+    
+    Revised Strategy:
+    The shelf layout changes (Shuffles).
+    We will store:
+    1. `removed`: Coordinates present in Initial but now empty.
+    2. `added`: Coordinates not in Initial but now occupied (Buffer spots).
+    """
+    print("📸 預計算高速快照 (V50)...")
+    
+    current_shelves = {
+        '2F': set(initial_shelf_sets['2F']),
+        '3F': set(initial_shelf_sets['3F'])
+    }
+    
+    # Convert sets to string keys "x,y" for easier diffing
+    base_sets = {
+        '2F': {f"{x},{y}" for x,y in initial_shelf_sets['2F']},
+        '3F': {f"{x},{y}" for x,y in initial_shelf_sets['3F']}
+    }
+    curr_sets = {
+        '2F': set(base_sets['2F']),
+        '3F': set(base_sets['3F'])
+    }
+    
+    snapshots = []
+    last_snap_time = -1000
+    
+    for idx, e in enumerate(events):
+        start_ts = e[0]
+        end_ts = e[1]
+        floor = e[2]
+        type_ = e[8]
+        
+        # Save snapshot every 300 sim seconds
+        if start_ts - last_snap_time >= 300:
+            # Calculate Delta to save space
+            # removed: in Base but not in Curr
+            # added: in Curr but not in Base
+            snap = {
+                't': int(start_ts),
+                'i': idx,
+                'd': {} # data by floor
+            }
+            for f in ['2F', '3F']:
+                removed = list(base_sets[f] - curr_sets[f])
+                added = list(curr_sets[f] - base_sets[f])
+                snap['d'][f] = {'r': removed, 'a': added}
+            
+            snapshots.append(snap)
+            last_snap_time = start_ts
+            
+        # Execute Logic
+        if type_ in ['SHELF_LOAD', 'SHUFFLE_LOAD']:
+            key = f"{e[4]},{e[5]}"
+            if key in curr_sets[floor]:
+                curr_sets[floor].remove(key)
+                
+        elif type_ in ['SHELF_UNLOAD', 'SHUFFLE_UNLOAD']:
+            key = f"{e[6]},{e[7]}" # Drop at End coords
+            curr_sets[floor].add(key)
+            
+    print(f"   -> 建立 {len(snapshots)} 個快照點，優化隨機存取效能。")
+    return snapshots
+
 def main():
-    print("🚀 [Step 5] 啟動視覺化 (V41: ID Merge & Ghost Fix)...")
+    print("🚀 [Step 5] 啟動視覺化 (V50: Real-Time Performance Optimized)...")
 
     map_2f = load_map_fixed('2F_map.xlsx', 32, 61)
     map_3f = load_map_fixed('3F_map.xlsx', 32, 61)
-    shelf_data = load_shelf_map()
+    shelf_data = load_shelf_map() # {'2F': set((x,y)), ...}
     
     events_path = os.path.join(LOG_DIR, 'simulation_events.csv')
     if not os.path.exists(events_path): 
@@ -82,8 +225,6 @@ def main():
         print("⚠️ 無有效事件資料")
         return
 
-    # 2. [重要] ID 正規化：合併 Ghost 17 與 Real 17
-    # 凡是能識別出是 AGV 的，統一名稱格式，這樣所有的事件就會歸屬到同一個物件
     df_events['obj_id'] = df_events['obj_id'].apply(normalize_obj_id)
 
     df_events['start_ts'] = df_events['start_ts'].astype('int64') // 10**9
@@ -95,17 +236,17 @@ def main():
     max_time = int(df_events['end_ts'].max())
     print(f"   📅 時間範圍: {pd.to_datetime(min_time, unit='s')} ~ {pd.to_datetime(max_time, unit='s')}")
 
+    # Convert to list for JSON
     events_data = df_events[['start_ts', 'end_ts', 'floor', 'obj_id', 'sx', 'sy', 'ex', 'ey', 'type', 'text']].values.tolist()
     
-    # 抓取 AGV ID (正規化後，現在只會有一組 AGV_17)
-    all_agvs = sorted(list(df_events[df_events['obj_id'].str.startswith('AGV')]['obj_id'].unique()))
-    
-    # 抓取 Station ID
-    all_stations = df_events[df_events['obj_id'].str.startswith('WS_')]['obj_id'].unique().tolist()
-    try: all_stations.sort(key=lambda x: int(x.split('_')[1]))
-    except: pass
+    # Pre-calculate Snapshots
+    snapshots_data = precompute_snapshots_robust(events_data, shelf_data)
 
-    # --- KPI Processing ---
+    # Info extraction
+    all_agvs = sorted(list(df_events[df_events['obj_id'].str.startswith('AGV')]['obj_id'].unique()))
+    all_stations = df_events[df_events['obj_id'].str.startswith('WS_')]['obj_id'].unique().tolist()
+    
+    # KPI Processing
     kpi_path = os.path.join(LOG_DIR, 'simulation_kpi.csv')
     kpi_raw = []
     calc_wave_totals = {}
@@ -115,7 +256,6 @@ def main():
         df_kpi = pd.read_csv(kpi_path, on_bad_lines='skip', engine='python')
         df_kpi['finish_ts'] = pd.to_datetime(df_kpi['finish_time'], errors='coerce')
         df_kpi = df_kpi.dropna(subset=['finish_ts'])
-        df_kpi = df_kpi[df_kpi['finish_ts'].dt.year > 2020]
         
         df_kpi['date'] = df_kpi['finish_ts'].dt.strftime('%Y-%m-%d')
         df_kpi['finish_ts'] = df_kpi['finish_ts'].astype('int64') // 10**9
@@ -123,11 +263,15 @@ def main():
         
         for _, row in df_kpi.iterrows():
             wid = str(row['wave_id'])
+            # Fill totals if logic allows, otherwise use what Step 4 provided
             if row['type'] == 'RECEIVING':
                 d = row['date']
                 calc_recv_totals[d] = calc_recv_totals.get(d, 0) + 1
             else:
-                calc_wave_totals[wid] = calc_wave_totals.get(wid, 0) + 1
+                # Step 4 now provides total_in_wave, we can use max of it
+                val = int(row.get('total_in_wave', 0))
+                if val > calc_wave_totals.get(wid, 0):
+                    calc_wave_totals[wid] = val
                 
         kpi_raw = df_kpi[['finish_ts', 'type', 'wave_id', 'is_delayed', 'date', 'workstation', 'total_in_wave', 'deadline_ts']].values.tolist()
 
@@ -139,7 +283,7 @@ def main():
 <html>
 <head>
     <meta charset="utf-8">
-    <title>Warehouse Monitor V41</title>
+    <title>Warehouse Monitor V50 (Performance)</title>
     <style>
         body { font-family: 'Segoe UI', sans-serif; margin: 0; display: flex; flex-direction: column; height: 100vh; overflow: hidden; background: #eef1f5; }
         .header { background: #fff; height: 40px; padding: 0 20px; display: flex; align-items: center; border-bottom: 1px solid #ddd; flex-shrink: 0; }
@@ -167,7 +311,7 @@ def main():
 </head>
 <body>
     <div class="header">
-        <h3>🏭 倉儲戰情室 (V41: ID Cleaned)</h3>
+        <h3>🏭 倉儲戰情室 (V50: Real-Time & High Perf)</h3>
         <div style="flex:1"></div>
         <span id="timeDisplay" style="font-weight: bold;">--</span>
     </div>
@@ -177,7 +321,7 @@ def main():
                 <div style="display:flex;align-items:center"><div class="box" style="background:#8d6e63"></div>料架</div>
                 <div style="display:flex;align-items:center"><div class="box" style="border-radius:50%;background:#00e5ff;border:1px solid #000"></div>AGV(空)</div>
                 <div style="display:flex;align-items:center"><div class="box" style="background:#d500f9;border:1px solid #fff"></div>AGV(載貨)</div>
-                <div style="display:flex;align-items:center"><div class="box" style="background:orange"></div>讓路</div>
+                <div style="display:flex;align-items:center"><div class="box" style="background:orange"></div>讓路/阻塞</div>
                 <div style="display:flex;align-items:center"><div class="box" style="background:red"></div>瞬移/警告</div>
             </div>
             <div class="floor-container">
@@ -214,22 +358,24 @@ def main():
             </div>
             <div class="controls">
                 <button onclick="togglePlay()" id="playBtn">Play</button>
-                <input type="range" id="slider" style="flex:1">
+                <input type="range" id="slider" style="flex:1" oninput="isSeeking=true" onchange="isSeeking=false; onSeek(this.value)">
                 <select id="speed">
-                    <option value="5">5s/s (Slow)</option>
-                    <option value="10" selected>10s/s (Normal)</option>
-                    <option value="30">30s/s (Fast)</option>
-                    <option value="60">1m/s</option>
-                    <option value="300">5m/s</option>
+                    <option value="5">5x Speed</option>
+                    <option value="10" selected>10x Speed</option>
+                    <option value="30">30x Speed</option>
+                    <option value="60">1 min/s</option>
+                    <option value="300">5 min/s</option>
                 </select>
             </div>
         </div>
     </div>
 <script>
+    // --- DATA INJECTION ---
     const map2F = __MAP2F__;
     const map3F = __MAP3F__;
-    const shelfData = __SHELF_DATA__; 
+    const initialShelfData = __SHELF_DATA__; 
     const events = __EVENTS__;
+    const snapshots = __SNAPSHOTS__;
     const kpiRaw = __KPI_RAW__;
     const agvIds = __AGV_IDS__;
     const stIds = __STATION_IDS__;
@@ -238,6 +384,8 @@ def main():
     
     let minTime = Number(__MIN_TIME__);
     let maxTime = Number(__MAX_TIME__);
+    
+    // --- INITIALIZATION ---
     if (isNaN(minTime)) minTime = Math.floor(Date.now()/1000);
     if (isNaN(maxTime)) maxTime = minTime + 3600;
     
@@ -245,23 +393,30 @@ def main():
     document.getElementById('slider').max = maxTime;
     document.getElementById('slider').value = minTime;
 
-    const initialShelfSets = { '2F': new Set(shelfData['2F']), '3F': new Set(shelfData['3F']) };
+    // Base Sets
+    const baseShelves = { '2F': new Set(initialShelfData['2F']), '3F': new Set(initialShelfData['3F']) };
+    // Current State (Mutable)
+    let currentShelves = { '2F': new Set(baseShelves['2F']), '3F': new Set(baseShelves['3F']) };
     
     let agvState = {};
     agvIds.forEach(id => { 
         agvState[id] = { floor: '2F', x: -1, y: -1, visible: false, color: '#00e5ff', loaded: false }; 
     });
     
-    let tempObjects = []; 
     let stState = {};
     stIds.forEach(id => { 
-        const num = parseInt(id.replace('WS_',''));
-        const f = num >= 100 ? '3F' : '2F';
-        stState[id] = { status: 'IDLE', color: 'WHITE', floor: f, x:-1, y:-1, wave:'-' }; 
+        // ID format usually WS_2F_1
+        let label = id;
+        try {
+            const parts = id.split('_');
+            if (parts.length >= 3) label = parts[2]; // Get '1' from WS_2F_1
+        } catch(e){}
+        
+        const f = id.includes('3F') ? '3F' : '2F';
+        stState[id] = { status: 'IDLE', color: 'WHITE', floor: f, x:-1, y:-1, label: label, text: 'Idle' }; 
     });
 
-    let currentShelves = { '2F': new Set(), '3F': new Set() };
-
+    // --- CANVAS SETUP ---
     function setupCanvas(id, mapData) {
         const c = document.getElementById(id);
         const ctx = c.getContext('2d');
@@ -281,28 +436,212 @@ def main():
     let f3 = setupCanvas('c3', map3F);
     window.onresize = () => { f2 = setupCanvas('c2', map2F); f3 = setupCanvas('c3', map3F); render(); };
 
+    // --- BINARY SEARCH UTILS ---
+    function bisectRight(arr, t) {
+        let lo = 0, hi = arr.length;
+        while (lo < hi) {
+            let mid = (lo + hi) >>> 1;
+            if (arr[mid][0] <= t) lo = mid + 1;
+            else hi = mid;
+        }
+        return lo;
+    }
+    
+    function bisectSnapshots(arr, t) {
+        let lo = 0, hi = arr.length;
+        while (lo < hi) {
+            let mid = (lo + hi) >>> 1;
+            if (arr[mid].t <= t) lo = mid + 1;
+            else hi = mid;
+        }
+        return lo - 1;
+    }
+
+    // --- PLAYBACK STATE ---
+    let currTime = minTime;
+    let lastProcessedIdx = 0;
+    let isPlaying = false;
+    let isSeeking = false;
+
+    // --- CORE LOGIC ---
+    function restoreSnapshot(snapIdx) {
+        const snap = snapshots[snapIdx];
+        if (!snap) return 0;
+        
+        // Restore Shelves using delta
+        ['2F', '3F'].forEach(f => {
+            currentShelves[f] = new Set(baseShelves[f]); // Reset to Base
+            // Apply Removed
+            snap.d[f].r.forEach(k => currentShelves[f].delete(k));
+            // Apply Added
+            snap.d[f].a.forEach(k => currentShelves[f].add(k));
+        });
+        
+        // Reset AGVs (snapshot logic for AGVs is complex, so we just clear visuals and let events fill in)
+        // Since we replay from snapshot time, AGVs will jump to position on next event.
+        // For smoother visual, we could store AGV pos in snapshot, but strictly not required if events are frequent.
+        agvIds.forEach(id => { 
+            agvState[id].visible = false; 
+        });
+
+        return snap.i; // Return the event index to start processing from
+    }
+
+    function onSeek(val) {
+        const targetTime = Number(val);
+        currTime = targetTime;
+        
+        // 1. Find closest previous snapshot
+        const snapIdx = bisectSnapshots(snapshots, targetTime);
+        let startIdx = 0;
+        
+        if (snapIdx >= 0) {
+            startIdx = restoreSnapshot(snapIdx);
+        } else {
+            // No snapshot before this time (early game), reset to zero
+            ['2F', '3F'].forEach(f => currentShelves[f] = new Set(baseShelves[f]));
+            startIdx = 0;
+        }
+        
+        // 2. Replay events from Snapshot Time to Target Time
+        // This 'Fast Forward' updates the state without rendering
+        fastProcess(startIdx, targetTime);
+        lastProcessedIdx = bisectRight(events, targetTime);
+        render();
+    }
+
+    function fastProcess(startIdx, targetTime) {
+        for(let i = startIdx; i < events.length; i++) {
+            const e = events[i];
+            if (e[0] > targetTime) break; // Past target
+            processEventLogic(e, targetTime, false);
+        }
+    }
+
+    function processEventLogic(e, time, isRealtime) {
+        const type = e[8];
+        const floor = e[2];
+        const startT = e[0];
+        const endT = e[1];
+        
+        // --- SHELF LOGIC ---
+        // 'SHUFFLE_LOAD' acts just like 'SHELF_LOAD' (Remove shelf from floor)
+        if (type === 'SHELF_LOAD' || type === 'SHUFFLE_LOAD') {
+            const key = e[4] + "," + e[5];
+            currentShelves[floor].delete(key);
+            if (e[3].startsWith('AGV')) agvState[e[3]].loaded = true;
+        } 
+        // 'SHUFFLE_UNLOAD' acts just like 'SHELF_UNLOAD' (Add shelf to floor)
+        else if (type === 'SHELF_UNLOAD' || type === 'SHUFFLE_UNLOAD') {
+            const key = e[6] + "," + e[7]; // Destination
+            currentShelves[floor].add(key);
+            if (e[3].startsWith('AGV')) agvState[e[3]].loaded = false;
+        }
+
+        // --- AGV MOVEMENT ---
+        if (e[3].startsWith('AGV')) {
+            const id = e[3];
+            if (time >= startT) {
+                agvState[id].floor = floor;
+                agvState[id].visible = true;
+                
+                // Interpolation for smooth movement
+                if (isRealtime && time <= endT && endT > startT) {
+                    const p = (time - startT) / (endT - startT);
+                    agvState[id].x = e[4] + (e[6] - e[4]) * p;
+                    agvState[id].y = e[5] + (e[7] - e[5]) * p;
+                } else {
+                    // Static position (finished move)
+                    agvState[id].x = e[6];
+                    agvState[id].y = e[7];
+                }
+                
+                // Color Logic
+                if (type === 'YIELD') agvState[id].color = 'orange';
+                else if (type === 'PARKING') agvState[id].color = 'green';
+                else if (type.includes('TELE') || type === 'FORCE_TELE') agvState[id].color = 'red';
+                else if (type.includes('SHUFFLE')) agvState[id].color = '#aa00ff'; // Darker purple for shuffle
+                else {
+                    agvState[id].color = agvState[id].loaded ? '#d500f9' : '#00e5ff';
+                }
+            }
+        }
+        
+        // --- STATION STATUS ---
+        if (type === 'STATION_STATUS') {
+            // "BLUE|Station 1|N"
+            if (time >= startT && time < endT) {
+                const sid = e[3];
+                if (stState[sid]) {
+                    const parts = e[9].split('|');
+                    stState[sid].color = parts[0];
+                    stState[sid].text = parts[1] || 'Busy';
+                }
+            }
+        }
+    }
+
+    function updateStateRealtime(time) {
+        // Optimized: Only process events relevant to current frame window or catch up
+        // Find where we should be
+        const endIdx = bisectRight(events, time);
+        
+        // If we jumped too far back or forward without seek, handle it
+        if (Math.abs(endIdx - lastProcessedIdx) > 500) {
+            onSeek(time); // Fallback to seek logic for safety
+            return;
+        }
+
+        // Process strictly forward
+        for(let i = lastProcessedIdx; i < endIdx; i++) {
+            processEventLogic(events[i], time, true);
+        }
+        
+        // Also update interpolation for currently active events (events that span across 'time')
+        // We can scan backward a bit or keep a set of 'active' events. 
+        // Simple hack: Scan last 50 events for any that encompass `time`.
+        const scanStart = Math.max(0, endIdx - 50);
+        for(let i = scanStart; i < endIdx; i++) {
+            const e = events[i];
+            if (e[1] > time) { // It's still finishing
+                processEventLogic(e, time, true);
+            }
+        }
+
+        lastProcessedIdx = endIdx;
+    }
+
+    // --- DRAWING ---
     function drawMap(obj, floorName) {
         const ctx = obj.ctx;
         ctx.fillStyle = '#fafafa'; ctx.fillRect(0,0, ctx.canvas.width, ctx.canvas.height);
         if(!obj.map) return;
         
+        // Draw Grid
         for(let r=0; r<obj.rows; r++) {
             for(let c=0; c<obj.cols; c++) {
                 const val = obj.map[r][c];
                 const x = obj.ox + c * obj.size;
                 const y = obj.oy + r * obj.size;
                 const s = obj.size;
-                if(val==1) { 
+                
+                // -1: Wall, 0: Aisle, 1: Storage (but might be empty), 2: Station
+                if (val === -1) { ctx.fillStyle = '#ccc'; ctx.fillRect(x,y,s,s); }
+                else if (val === 2) { ctx.strokeStyle = '#bbb'; ctx.strokeRect(x,y,s,s); }
+                else { 
+                    // Floor
+                    ctx.fillStyle = 'white'; ctx.fillRect(x,y,s,s); 
+                    // Shelf check
                     const key = c + "," + r;
-                    ctx.fillStyle = currentShelves[floorName].has(key) ? '#8d6e63' : '#eee';
-                    ctx.fillRect(x,y,s,s); 
-                } 
-                else if(val==-1) { ctx.fillStyle = '#ccc'; ctx.fillRect(x,y,s,s); } 
-                else if(val==2) { ctx.strokeStyle='#bbb'; ctx.strokeRect(x,y,s,s); } 
-                else { ctx.fillStyle = 'white'; ctx.fillRect(x,y,s,s); }
+                    if (currentShelves[floorName].has(key)) {
+                        ctx.fillStyle = '#8d6e63';
+                        ctx.fillRect(x+1,y+1,s-2,s-2);
+                    }
+                }
             }
         }
         
+        // Draw Stations
         Object.keys(stState).forEach(sid => {
             const s = stState[sid];
             if(s.floor === floorName && s.x !== -1) {
@@ -310,106 +649,18 @@ def main():
                 ctx.fillStyle = s.color === 'BLUE' ? '#007bff' : s.color === 'GREEN' ? '#28a745' : '#ddd';
                 ctx.fillRect(x+1, y+1, sz-2, sz-2);
                 ctx.fillStyle = 'black'; ctx.font = 'bold 8px Arial';
-                ctx.fillText(sid.replace('WS_',''), x+2, y+sz/1.5);
+                ctx.fillText(s.label, x+2, y+sz/1.5);
             }
         });
-    }
-
-    let currTime = minTime;
-    let isPlaying = false;
-
-    function updateState(time) {
-        currentShelves['2F'] = new Set(initialShelfSets['2F']);
-        currentShelves['3F'] = new Set(initialShelfSets['3F']);
-        tempObjects = [];
-        
-        agvIds.forEach(id => { 
-            agvState[id].visible = false; 
-            agvState[id].loaded = false; 
-            agvState[id].color = '#00e5ff';
-        });
-        
-        // Chronological Replay with ID Merged Events
-        for(let i=0; i<events.length; i++) {
-            const e = events[i];
-            const startT = e[0];
-            const endT = e[1];
-            
-            if (startT > time) break;
-            
-            // --- SHELF LOGIC ---
-            if (e[8] === 'SHELF_LOAD' || e[8] === 'SHUFFLE') { 
-                const key = e[4] + "," + e[5];
-                currentShelves[e[2]].delete(key);
-            } 
-            if (e[8] === 'SHELF_UNLOAD' || e[8] === 'SHUFFLE') { 
-                if(e[8] === 'SHUFFLE') {
-                    const key = e[6] + "," + e[7];
-                    currentShelves[e[2]].add(key);
-                } else if(e[8] === 'SHELF_UNLOAD') {
-                    const key = e[4] + "," + e[5];
-                    currentShelves[e[2]].add(key);
-                }
-            }
-
-            // --- AGV LOGIC ---
-            if (e[3].startsWith('AGV')) {
-                const id = e[3];
-                // History Replay
-                if (e[8] === 'SHELF_LOAD') agvState[id].loaded = true;
-                if (e[8] === 'SHELF_UNLOAD') agvState[id].loaded = false;
-                
-                if (time >= startT) {
-                    agvState[id].floor = e[2];
-                    agvState[id].visible = true;
-                    
-                    if (time <= endT && endT > startT) {
-                        const p = (time - startT) / (endT - startT);
-                        agvState[id].x = e[4] + (e[6] - e[4]) * p;
-                        agvState[id].y = e[5] + (e[7] - e[5]) * p;
-                        
-                        if (e[8] === 'NUDGE' || e[8] === 'YIELD') agvState[id].color = 'orange';
-                        else if (e[8] === 'PARKING') agvState[id].color = 'green';
-                        else if (e[8].includes('TELE') || e[8] === 'FORCE_TELE') agvState[id].color = 'red';
-                        else {
-                            agvState[id].color = agvState[id].loaded ? '#d500f9' : '#00e5ff';
-                        }
-                    } else {
-                        // Finished event - hold position
-                        agvState[id].x = e[6];
-                        agvState[id].y = e[7];
-                        agvState[id].color = agvState[id].loaded ? '#d500f9' : '#00e5ff';
-                    }
-                }
-            }
-            
-            // --- STATION LOGIC ---
-            if (e[8] === 'STATION_STATUS') {
-                if (time >= startT && time < endT) {
-                    const sid = e[3];
-                    if(stState[sid]) {
-                        const parts = e[9].split('|');
-                        stState[sid].color = parts[0];
-                        stState[sid].wave = parts[1];
-                        stState[sid].status = parts[0] === 'BLUE' ? 'WORK' : 'IDLE';
-                    }
-                }
-            }
-            
-            if (e[8] === 'SHUFFLE' && time >= startT && time <= endT) {
-                const p = (time - startT) / (endT - startT);
-                const cx = e[4] + (e[6] - e[4]) * p;
-                const cy = e[5] + (e[7] - e[5]) * p;
-                tempObjects.push({ floor: e[2], x: cx, y: cy, color: 'purple' });
-            }
-        }
     }
 
     function render() {
-        updateState(currTime);
+        if (!isSeeking) updateStateRealtime(currTime);
+        
         drawMap(f2, '2F');
         drawMap(f3, '3F');
         
+        // Draw AGVs
         let activeCount = 0;
         Object.keys(agvState).forEach(id => {
             const s = agvState[id];
@@ -427,106 +678,92 @@ def main():
             obj.ctx.fill();
             obj.ctx.strokeStyle = '#333'; obj.ctx.lineWidth = 1; obj.ctx.stroke();
             
+            // Draw box if loaded
             if (s.loaded && !['red','orange','green'].includes(s.color)) {
                 obj.ctx.fillStyle = '#fff';
                 obj.ctx.fillRect(px-sz/4, py-sz/4, sz/2, sz/2);
             }
-
-            // [V41 Fix] 僅顯示數字，移除 AGV_ 前綴
+            
+            // Label (Just Number)
             if (sz > 8) {
                 obj.ctx.fillStyle = 'black'; 
-                obj.ctx.font = 'bold 10px Arial';
+                obj.ctx.font = 'bold 9px Arial';
                 obj.ctx.textAlign = 'center';
                 const label = id.replace('AGV_', '');
-                obj.ctx.fillText(label, px, py+4);
+                obj.ctx.fillText(label, px, py+3);
             }
         });
         document.getElementById('val-active').innerText = activeCount;
 
-        tempObjects.forEach(o => {
-            const obj = o.floor == '2F' ? f2 : f3;
-            if(!obj.map) return;
-            const sz = obj.size;
-            const px = obj.ox + o.x * sz;
-            const py = obj.oy + o.y * sz;
-            obj.ctx.fillStyle = o.color;
-            obj.ctx.fillRect(px+2, py+2, sz-4, sz-4);
-        });
-        
-        // Stations
-        let h2 = '', h3 = '';
-        stIds.forEach(sid => {
-            const s = stState[sid];
-            const color = s.color === 'BLUE' ? '#007bff' : s.color === 'GREEN' ? '#28a745' : '#ddd';
-            const label = sid.replace('WS_','');
-            const card = `<div class="station-card"><div style="font-weight:bold">${label}</div><div style="margin-top:2px"><span class="status-dot" style="background:${color}"></span>${s.wave}</div></div>`;
-            if (s.floor === '2F') h2 += card; else h3 += card;
-        });
-        document.getElementById('st-list-2f').innerHTML = h2 || 'No Data';
-        document.getElementById('st-list-3f').innerHTML = h3 || 'No Data';
-
-        // KPI
-        const doneTasks = kpiRaw.filter(k => k[0] <= currTime);
-        document.getElementById('val-done').innerText = doneTasks.length;
-        
+        // KPI & Time
         const dObj = new Date(currTime*1000);
         document.getElementById('timeDisplay').innerText = dObj.toLocaleString();
-        document.getElementById('slider').value = currTime;
+        if (!isSeeking) document.getElementById('slider').value = currTime;
+
+        // Progress Lists (Simplified for perf)
+        // Only update these once per second
+        if (Math.floor(currTime) % 2 === 0) updateDashboardLists(dObj);
+    }
+
+    function updateDashboardLists(dObj) {
+        // Find completed tasks up to currTime
+        // KPI is pre-sorted by finish_time
+        const kIdx = bisectRight(kpiRaw, currTime);
+        const doneSlice = kpiRaw.slice(0, kIdx);
         
-        // Progress Bars
-        const waveProgress = {};
-        const recvProgress = {};
-        let totalDelay = 0;
-
-        doneTasks.forEach(k => {
-            if(k[1]=='RECEIVING') recvProgress[k[4]] = (recvProgress[k[4]]||0)+1;
-            else {
-                waveProgress[k[2]] = (waveProgress[k[2]]||0)+1;
-                if(k[3]=='Y') totalDelay++;
-            }
+        document.getElementById('val-done').innerText = doneSlice.length;
+        
+        let delayed = 0;
+        let waveProg = {};
+        let recvProg = {};
+        
+        doneSlice.forEach(k => {
+            if (k[3] === 'Y') delayed++;
+            if (k[1] === 'RECEIVING') recvProg[k[4]] = (recvProg[k[4]]||0) + 1;
+            else waveProg[k[2]] = (waveProg[k[2]]||0) + 1;
         });
-        document.getElementById('val-delay').innerText = totalDelay;
+        document.getElementById('val-delay').innerText = delayed;
 
+        // Wave HTML
         let wHtml = '';
         const activeWaves = Object.keys(waveTotals).sort(); 
         activeWaves.forEach(wid => {
             const total = waveTotals[wid];
-            const done = waveProgress[wid] || 0;
-            if (done < total || (done >= total && doneTasks.some(k=>k[2]==wid && k[0] > currTime - 1800))) {
-                const pct = Math.min(100, (done/total*100)).toFixed(0);
+            const done = waveProg[wid] || 0;
+            // Show if active or recently finished
+            if (done < total || (done >= total && Math.random() > 0.9)) { 
+                const pct = total > 0 ? Math.min(100, (done/total*100)).toFixed(0) : 0;
                 wHtml += `<div class="wave-item"><div style="display:flex;justify-content:space-between"><span>${wid}</span><span>${done}/${total}</span></div><div class="progress-bg"><div class="progress-fill" style="width:${pct}%;background:#007bff"></div></div></div>`;
             }
         });
         document.getElementById('wave-list').innerHTML = wHtml || '<div style="color:#999;padding:5px">No Active Waves</div>';
         
-        let rHtml = '';
-        const todayStr = `${dObj.getFullYear()}-${String(dObj.getMonth()+1).padStart(2,'0')}-${String(dObj.getDate()).padStart(2,'0')}`;
-        if (recvTotals[todayStr]) {
-             const total = recvTotals[todayStr];
-             const done = recvProgress[todayStr] || 0;
-             const pct = total > 0 ? Math.min(100, (done/total*100)).toFixed(0) : 0;
-             rHtml += `<div class="wave-item"><div style="display:flex;justify-content:space-between"><span>📅 ${todayStr} (Inbound)</span><span>${done}/${total}</span></div><div class="progress-bg"><div class="progress-fill" style="width:${pct}%;background:#28a745"></div></div></div>`;
-        } else {
-             rHtml = `<div style="color:#999;padding:5px">No Inbound Plan for ${todayStr}</div>`;
-        }
-        document.getElementById('recv-list').innerHTML = rHtml;
+        // Station HTML
+        let h2 = '', h3 = '';
+        Object.keys(stState).forEach(sid => {
+            const s = stState[sid];
+            const card = `<div class="station-card"><div style="font-weight:bold">${s.label}</div><div style="margin-top:2px"><span class="status-dot" style="background:${s.color === 'WHITE' ? '#ddd' : s.color === 'BLUE' ? '#007bff' : '#28a745'}"></span>${s.text}</div></div>`;
+            if (s.floor === '2F') h2 += card; else h3 += card;
+        });
+        document.getElementById('st-list-2f').innerHTML = h2;
+        document.getElementById('st-list-3f').innerHTML = h3;
     }
 
+    // --- ANIMATION LOOP ---
     function animate() {
-        if(isPlaying) {
+        if(isPlaying && !isSeeking) {
             const speed = parseInt(document.getElementById('speed').value);
             currTime += (1/30) * speed; 
-            if(currTime > maxTime) { isPlaying=false; currTime=minTime; }
-            document.getElementById('slider').value = currTime;
+            if(currTime > maxTime) { isPlaying=false; currTime=minTime; onSeek(minTime); }
             render();
         }
         requestAnimationFrame(animate);
     }
     
     function togglePlay() { isPlaying=!isPlaying; }
-    document.getElementById('slider').addEventListener('input', e=>{ currTime=parseInt(e.target.value); render(); });
     
-    render();
+    // Initial Render
+    onSeek(minTime);
     animate();
     
 </script>
@@ -534,6 +771,7 @@ def main():
 </html>
 """
     
+    # Serialize Shelf Data correctly
     js_shelf_data = {'2F': [], '3F': []}
     for f in shelf_data: js_shelf_data[f] = [f"{c[0]},{c[1]}" for c in shelf_data[f]]
 
@@ -541,6 +779,7 @@ def main():
                               .replace('__MAP3F__', json.dumps(map_3f)) \
                               .replace('__SHELF_DATA__', json.dumps(js_shelf_data)) \
                               .replace('__EVENTS__', json.dumps(events_data)) \
+                              .replace('__SNAPSHOTS__', json.dumps(snapshots_data)) \
                               .replace('__KPI_RAW__', json.dumps(kpi_raw)) \
                               .replace('__AGV_IDS__', json.dumps(all_agvs)) \
                               .replace('__STATION_IDS__', json.dumps(all_stations)) \
@@ -551,7 +790,7 @@ def main():
 
     with open(OUTPUT_HTML, 'w', encoding='utf-8') as f:
         f.write(final_html)
-    print(f"✅ 視覺化生成完畢: {OUTPUT_HTML} (V41: Ghosts Busted)")
+    print(f"✅ 視覺化生成完畢: {OUTPUT_HTML} (V50: High Performance)")
 
 if __name__ == "__main__":
     main()

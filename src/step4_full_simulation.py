@@ -9,9 +9,11 @@ import math
 from collections import defaultdict, deque, Counter
 from datetime import datetime, timedelta
 
+# ---------------- CONFIG ----------------
 BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 LOG_DIR = os.path.join(BASE_DIR, 'logs')
 os.makedirs(LOG_DIR, exist_ok=True)
+# ----------------------------------------
 
 class TimeAwareAStar:
     def __init__(self, grid, reservations_dict, shelf_occupancy_set):
@@ -19,8 +21,8 @@ class TimeAwareAStar:
         self.rows, self.cols = grid.shape
         self.reservations = reservations_dict
         self.shelf_occupancy = shelf_occupancy_set 
-        self.moves = [(0, 1), (0, -1), (1, 0), (-1, 0), (0, 0)]
-        self.max_steps = 2500 
+        self.moves = [(0, 1), (0, -1), (1, 0), (-1, 0), (0, 0)] # E, W, S, N, Wait
+        self.max_steps = 3000 # Increased for complex shuffles
 
     def heuristic(self, a, b):
         return abs(a[0] - b[0]) + abs(a[1] - b[1])
@@ -29,12 +31,15 @@ class TimeAwareAStar:
         if not (0 <= start[0] < self.rows and 0 <= start[1] < self.cols): return None, None
         if not (0 <= goal[0] < self.rows and 0 <= goal[1] < self.cols): return None, None
         if self.grid[start[0]][start[1]] == -1: return None, None
+        # Goal check skipped here to allow finding path adjacent to blocked goal if needed, 
+        # but standard A* needs valid goal.
         if self.grid[goal[0]][goal[1]] == -1: return None, None
 
         if start == goal: return [(start, start_time_sec)], start_time_sec
         
+        # Dynamic timeout based on distance
         dist = self.heuristic(start, goal)
-        dynamic_max_steps = max(2000, dist * 20) 
+        dynamic_max_steps = max(2000, dist * 25) 
 
         open_set = []
         h_start = self.heuristic(start, goal)
@@ -44,6 +49,7 @@ class TimeAwareAStar:
         g_score = {(start, start_time_sec, (0,0)): 0}
         
         steps = 0
+        # Costs
         NORMAL_COST = 1      
         TURNING_COST = 1.5   
         WAIT_COST = 1.0       
@@ -67,21 +73,26 @@ class TimeAwareAStar:
                     val = self.grid[nr][nc]
                     if val == -1: continue 
                     
+                    # 1. Dynamic Obstacles (Other AGVs)
                     if not ignore_dynamic:
-                        if (next_time - start_time_sec) < 45: 
+                        # Only check near future to save performance
+                        if (next_time - start_time_sec) < 60: 
                             if next_time in self.reservations and (nr, nc) in self.reservations[next_time]:
                                 continue
                     
+                    # 2. Static Obstacles (Shelves on floor)
+                    # If we are loaded, we cannot step on an occupied spot (unless it's the goal or start)
                     is_spot_occupied = ((nr, nc) in self.shelf_occupancy)
                     step_cost = NORMAL_COST
                     
                     if is_loaded and is_spot_occupied:
                         if (nr, nc) != goal and (nr, nc) != start:
                             if allow_tunneling:
-                                step_cost = TUNNEL_COST
+                                step_cost = TUNNEL_COST # High cost to discourage but allow if desperate
                             else:
                                 continue 
 
+                    # 3. Movement Costs
                     if dr == 0 and dc == 0: step_cost += WAIT_COST
                     elif (dr, dc) != last_move and last_move != (0,0): step_cost += TURNING_COST
 
@@ -117,18 +128,24 @@ class TrafficController:
         self.reservations = reservations
 
     def clear_path_obstacles(self, start_pos, goal_pos, current_time, w_evt, floor, my_agv_name):
+        # Simplified Logic: Check immediate next step or simple straight line
+        # Finding exact blocker is hard without the failed path. 
+        # Here we scan a small box around the start/goal vector
         blocker_id = None
         blocker_pos = None
         
         curr = list(start_pos)
         target = list(goal_pos)
         steps_checked = 0
-        while curr != target and steps_checked < 5:
+        
+        # Simple raycast
+        while curr != target and steps_checked < 8:
             if curr[0] < target[0]: curr[0] += 1
             elif curr[0] > target[0]: curr[0] -= 1
             elif curr[1] < target[1]: curr[1] += 1
             elif curr[1] > target[1]: curr[1] -= 1
             check_pos = tuple(curr)
+            
             for agv_id, state in self.agv_pool.items():
                 if f"AGV_{agv_id}" == my_agv_name: continue
                 if state['pos'] == check_pos:
@@ -140,18 +157,24 @@ class TrafficController:
             
         if not blocker_id: return False, 0
 
+        # Found a blocker AGV, tell it to move (Yield)
         sanctuary = self._find_sanctuary(blocker_pos, current_time)
         if sanctuary:
             self.agv_pool[blocker_id]['pos'] = sanctuary
             dist = abs(blocker_pos[0]-sanctuary[0]) + abs(blocker_pos[1]-sanctuary[1])
             cost = dist * 2.0 
+            
+            # Record Yield Event
             w_evt.writerow([
                 datetime.fromtimestamp(current_time), datetime.fromtimestamp(current_time+int(cost)), 
-                floor, f"AGV_{blocker_id}", blocker_pos[1], blocker_pos[0], sanctuary[1], sanctuary[0], 'YIELD', f'Evicted by {my_agv_name}'
+                floor, f"AGV_{blocker_id}", blocker_pos[1], blocker_pos[0], sanctuary[1], sanctuary[0], 'YIELD', f'Yield for {my_agv_name}'
             ])
+            
+            # Reserve space for the yielding AGV
             for t in range(int(cost) + 5):
                 self.reservations[current_time + t].add(sanctuary)
             return True, cost
+            
         return False, 0
 
     def _find_sanctuary(self, start_pos, current_time):
@@ -162,18 +185,22 @@ class TrafficController:
         while q and count < max_search:
             curr = q.popleft()
             count += 1
+            
             if curr != start_pos and self.grid[curr[0]][curr[1]] != -1:
+                # Check if reserved
                 is_reserved = False
                 for t in range(5):
                     if curr in self.reservations[current_time + t]:
                         is_reserved = True; break
                 if not is_reserved:
+                    # Check if occupied by another AGV
                     is_occupied = False
                     for state in self.agv_pool.values():
                         if state['pos'] == curr:
                             is_occupied = True; break
                     if not is_occupied:
                         return curr 
+            
             for dr, dc in [(0,1), (0,-1), (1,0), (-1,0)]:
                 nr, nc = curr[0]+dr, curr[1]+dc
                 if 0<=nr<self.rows and 0<=nc<self.cols:
@@ -190,37 +217,88 @@ class ShuffleManager:
         self.pos_to_id = pos_to_shelf_id_map
         self.shelf_coords = shelf_coords
 
-    def try_make_space(self, target_pos, w_evt, current_time, floor, agv_name):
+    def execute_real_shuffle(self, agv_pos, target_pos, w_evt, current_time, floor, agv_name, astar, res_table, write_move_fn, base_dt):
+        """
+        True Real-World Shuffle (Fixed for Unknown/Ghost Shelves):
+        1. Identify Blocker.
+        2. AGV moves to Blocker.
+        3. AGV moves Blocker to Buffer (Move Out).
+        """
         blockers = []
+        # Check 4 neighbors
         for dr, dc in [(0,1), (0,-1), (1,0), (-1,0)]:
             nr, nc = target_pos[0]+dr, target_pos[1]+dc
             if (nr, nc) in self.occupancy:
                 blockers.append((nr, nc))
-        if not blockers: return False, 0
+        
+        if not blockers: return False, current_time, agv_pos
 
-        total_penalty = 0
-        moved_count = 0
-        for blk_pos in blockers:
-            buffer_pos = self._find_nearest_empty(blk_pos)
-            if buffer_pos:
-                self._execute_logical_move(blk_pos, buffer_pos, w_evt, current_time, floor)
-                dist_shuffle = abs(blk_pos[0]-buffer_pos[0]) + abs(blk_pos[1]-buffer_pos[1])
-                cost = 10.0 + (dist_shuffle * 2.0) + 15.0 
-                total_penalty += cost
-                moved_count += 1
-                if moved_count >= 1: break 
-        if moved_count > 0: return True, total_penalty
-        return False, 0
+        # Pick the first blocker
+        blk_pos = blockers[0]
+        sid = self.pos_to_id.get(blk_pos, "Unknown")
+        
+        # 1. Find Buffer
+        buffer_pos = self._find_nearest_empty(blk_pos)
+        if not buffer_pos: return False, current_time, agv_pos
+
+        total_t = current_time
+
+        # --- STEP A: Move to Blocker ---
+        path_to_blk, end_t = astar.find_path(agv_pos, blk_pos, total_t, is_loaded=False, ignore_dynamic=True)
+        if not path_to_blk: return False, current_time, agv_pos
+        
+        write_move_fn(w_evt, path_to_blk, floor, agv_name.replace("AGV_", ""), res_table)
+        total_t = end_t
+        
+        # Load Blocker Event
+        w_evt.writerow([
+            base_dt + timedelta(seconds=total_t), base_dt + timedelta(seconds=total_t+5), 
+            floor, agv_name, blk_pos[1], blk_pos[0], blk_pos[1], blk_pos[0], 'SHUFFLE_LOAD', f"Moving {sid}"
+        ])
+        total_t += 5
+        if blk_pos in self.occupancy: self.occupancy.remove(blk_pos) # Lift up
+
+        # --- STEP B: Move Blocker to Buffer ---
+        path_to_buf, end_t = astar.find_path(blk_pos, buffer_pos, total_t, is_loaded=True, ignore_dynamic=True)
+        if not path_to_buf:
+            self.occupancy.add(blk_pos) # Failed, put back
+            return False, current_time, agv_pos
+        
+        write_move_fn(w_evt, path_to_buf, floor, agv_name.replace("AGV_", ""), res_table)
+        total_t = end_t
+        
+        # Unload Blocker Event
+        w_evt.writerow([
+            base_dt + timedelta(seconds=total_t), base_dt + timedelta(seconds=total_t+5), 
+            floor, agv_name, buffer_pos[1], buffer_pos[0], buffer_pos[1], buffer_pos[0], 'SHUFFLE_UNLOAD', f"Placed {sid}"
+        ])
+        total_t += 5
+        
+        # Update Logical State
+        self.occupancy.add(buffer_pos)
+        
+        # [FIX] 防呆機制：只有當 ID 存在於資料庫時才更新座標
+        if sid != "Unknown" and sid in self.shelf_coords:
+            self.shelf_coords[sid]['pos'] = buffer_pos
+            
+        # Update lookup map
+        if blk_pos in self.pos_to_id:
+            del self.pos_to_id[blk_pos]
+        self.pos_to_id[buffer_pos] = sid
+        
+        return True, total_t, buffer_pos
 
     def _find_nearest_empty(self, start_pos):
         q = deque([start_pos])
         visited = {start_pos}
-        max_dist = 10 
+        max_dist = 15 
         while q:
             curr = q.popleft()
             if self.grid[curr[0]][curr[1]] != -1 and curr not in self.occupancy:
                 return curr
+            
             if abs(curr[0]-start_pos[0]) + abs(curr[1]-start_pos[1]) > max_dist: continue
+            
             for dr, dc in [(0,1), (0,-1), (1,0), (-1,0)]:
                 nr, nc = curr[0]+dr, curr[1]+dc
                 if 0<=nr<self.rows and 0<=nc<self.cols:
@@ -228,19 +306,6 @@ class ShuffleManager:
                         visited.add((nr, nc))
                         q.append((nr, nc))
         return None
-
-    def _execute_logical_move(self, start, end, w_evt, t, floor):
-        sid = self.pos_to_id.get(start)
-        if not sid: return
-        self.occupancy.remove(start)
-        self.occupancy.add(end)
-        self.shelf_coords[sid]['pos'] = end
-        del self.pos_to_id[start]
-        self.pos_to_id[end] = sid
-        w_evt.writerow([
-            datetime.fromtimestamp(t), datetime.fromtimestamp(t+1), 
-            floor, f"Shelf_{sid}", start[1], start[0], end[1], end[0], 'SHUFFLE', 'Moved aside'
-        ])
 
 class ParkingManager:
     def __init__(self, grid, shelf_occupancy):
@@ -252,10 +317,13 @@ class ParkingManager:
         visited = {current_pos}
         while q:
             curr = q.popleft()
+            # Valid parking: Not occupied by shelf, not active shelf
             if curr in self.shelf_occupancy and curr not in active_shelves_pos:
                 return curr
+            
             if abs(curr[0]-current_pos[0]) + abs(curr[1]-current_pos[1]) > 50:
                 continue
+                
             for dr, dc in [(0,1), (0,-1), (1,0), (-1,0)]:
                 nr, nc = curr[0]+dr, curr[1]+dc
                 if 0<=nr<self.grid.shape[0] and 0<=nc<self.grid.shape[1]:
@@ -266,57 +334,74 @@ class ParkingManager:
 
 class OrderProcessor:
     def __init__(self, stations_2f, stations_3f):
+        # Stations keys are now strings like '2F_1', '3F_1'
         self.stations = {'2F': list(stations_2f.keys()), '3F': list(stations_3f.keys())}
         self.cust_station_map = {} 
+
     def process_wave(self, wave_orders, floor):
         wave_custs = wave_orders['PARTCUSTID'].unique()
         available_stations = self.stations.get(floor, [])
         if not available_stations: return []
+        
+        # Assign customers to stations
         for i, cust_id in enumerate(wave_custs):
             if cust_id not in self.cust_station_map:
                 st_idx = i % len(available_stations)
                 self.cust_station_map[cust_id] = available_stations[st_idx]
+
         shelf_tasks = defaultdict(list)
         for _, row in wave_orders.iterrows():
             loc = str(row.get('LOC', '')).strip()
             if len(loc) < 9: continue 
+            
             shelf_id = loc[:9]
             face = loc[10] if len(loc) > 10 else 'A'
             cust_id = row.get('PARTCUSTID')
+            
             target_st = self.cust_station_map.get(cust_id)
             if not target_st: target_st = random.choice(available_stations)
+            
             shelf_tasks[shelf_id].append({
                 'face': face, 'station': target_st,
                 'sku': f"{row.get('FRCD','')}_{row.get('PARTNO','')}",
                 'qty': row.get('QTY', 1), 'order_row': row
             })
+
         final_tasks = []
         for shelf_id, orders in shelf_tasks.items():
+            # Optimize picking sequence at station
             orders.sort(key=lambda x: (x['station'], x['face']))
             stops = []
+            
             current_st = None
             current_face = None
             current_sku_group = defaultdict(int) 
+            
             for o in orders:
                 st = o['station']
                 face = o['face']
                 sku = o['sku']
+                
                 if (st != current_st or face != current_face) and current_st is not None:
                     proc_time = self._calc_time(current_sku_group)
                     stops.append({'station': current_st, 'face': current_face, 'time': proc_time})
                     current_sku_group = defaultdict(int)
+                
                 current_st = st
                 current_face = face
                 current_sku_group[sku] += 1
+            
             if current_st is not None:
                 proc_time = self._calc_time(current_sku_group)
                 stops.append({'station': current_st, 'face': current_face, 'time': proc_time})
+                
             final_tasks.append({
                 'shelf_id': shelf_id, 'stops': stops,
                 'wave_id': orders[0]['order_row'].get('WAVE_ID'),
                 'raw_orders': [o['order_row'] for o in orders]
             })
         return final_tasks
+
     def _calc_time(self, sku_group):
         total_time = 0
         for sku, count in sku_group.items(): total_time += 15 + (count * 5)
@@ -324,7 +409,7 @@ class OrderProcessor:
 
 class AdvancedSimulationRunner:
     def __init__(self):
-        print(f"🚀 [Step 4] 啟動進階模擬 (V88: Consolidation Fix)...")
+        print(f"🚀 [Step 4] 啟動進階模擬 (V42: Real Shuffle & KPI Fix)...")
         
         self.grid_2f = self._load_map_correct('2F_map.xlsx', 32, 61)
         self.grid_3f = self._load_map_correct('3F_map.xlsx', 32, 61)
@@ -337,6 +422,7 @@ class AdvancedSimulationRunner:
         self.pos_to_sid_2f = {}
         self.pos_to_sid_3f = {}
         
+        # Init Grids
         r2, c2 = self.grid_2f.shape
         for r in range(r2):
             for c in range(c2):
@@ -360,9 +446,10 @@ class AdvancedSimulationRunner:
         self.inventory_map = self._load_inventory() 
         self.all_tasks_raw = self._load_all_tasks()
         
-        # [V88] 使用強制聚合邏輯
+        # Stickiness Logic
         self._assign_locations_smartly(self.all_tasks_raw)
         
+        # Station Init (Updated for Standard Naming)
         self.stations = self._init_stations()
         st_2f = {k:v for k,v in self.stations.items() if v['floor']=='2F'}
         st_3f = {k:v for k,v in self.stations.items() if v['floor']=='3F'}
@@ -371,6 +458,8 @@ class AdvancedSimulationRunner:
         
         self.used_spots_2f = set()
         self.used_spots_3f = set()
+        
+        # AGV Init
         self.agv_state = {
             '2F': {i: {'time': 0, 'pos': self._get_strict_spawn_spot(self.grid_2f, self.used_spots_2f, '2F')} for i in range(1, 19)},
             '3F': {i: {'time': 0, 'pos': self._get_strict_spawn_spot(self.grid_3f, self.used_spots_3f, '3F')} for i in range(101, 119)}
@@ -440,32 +529,27 @@ class AdvancedSimulationRunner:
         tasks.sort(key=lambda x: x['datetime'])
         return tasks 
 
-    # [V88] Stickiness Logic to enforce merging
     def _assign_locations_smartly(self, tasks):
         print("   -> Running Inventory Consolidation (Stickiness Mode)...")
         part_shelf_map = {}
         valid_shelves = list(self.shelf_coords.keys())
         
-        # 1. 學習已有的位置 (Learn Fixed LOCs)
         for t in tasks:
             part = str(t.get('PARTNO', '')).strip()
             loc = str(t.get('LOC', '')).strip()
             if len(loc) >= 9:
                 if part not in part_shelf_map:
-                    part_shelf_map[part] = loc # 記住這個料號對應的位置
+                    part_shelf_map[part] = loc 
 
-        # 2. 分配缺失的位置 (Assign Missing)
         for t in tasks:
             loc = str(t.get('LOC', '')).strip()
             if len(loc) >= 9: continue 
             
             part = str(t.get('PARTNO', '')).strip()
             
-            # Stickiness Check: 如果這料號之前已經有位置，就用一樣的 (最大化合併)
             if part in part_shelf_map:
                 t['LOC'] = part_shelf_map[part]
             else:
-                # 新料號，選擇庫存清單的第一個 (保持一致性)
                 cands = self.inventory_map.get(part, [])
                 if cands:
                     chosen = cands[0] 
@@ -557,14 +641,19 @@ class AdvancedSimulationRunner:
                     if grid[r][c] == 2: candidates.append((r, c))
             candidates.sort() 
             return candidates
+            
+        # 2F Stations: WS_2F_1, WS_2F_2 ...
         cands_2f = find_stations(self.grid_2f)
         for i, pos in enumerate(cands_2f):
-            sid = i + 1 
+            sid = f"2F_{i + 1}" 
             sts[sid] = {'floor': '2F', 'pos': pos, 'free_time': 0}
+            
+        # 3F Stations: WS_3F_1, WS_3F_2 ...
         cands_3f = find_stations(self.grid_3f)
         for i, pos in enumerate(cands_3f):
-            sid = 101 + i 
+            sid = f"3F_{i + 1}"
             sts[sid] = {'floor': '3F', 'pos': pos, 'free_time': 0}
+            
         return sts
 
     def _is_physically_connected(self, grid, start, end):
@@ -624,7 +713,7 @@ class AdvancedSimulationRunner:
 
             path, _ = astar.find_path(curr, target, t, is_loaded=loaded, ignore_dynamic=False)
             
-            # [V88] Faster Rerouting (2 retries instead of 3)
+            # Fast Return Rerouting
             if not path and is_returning and retry_count > 2:
                 new_candidates = self._find_smart_storage_spot(
                     curr, self.valid_storage_spots[floor], 
@@ -635,24 +724,32 @@ class AdvancedSimulationRunner:
                     retry_count = 0 
                     continue
 
+            # Traffic Control (Yielding)
             if not path and (t - start_wait > 5):
                 success, penalty = traffic_ctrl.clear_path_obstacles(curr, target, t, w_evt, floor, agv_name)
                 if success:
                     t += int(penalty)
                     continue
 
+            # Shuffle Logic (Real Move)
             if not path and (t - start_wait > 10): 
-                success, penalty = shuffler.try_make_space(target, w_evt, t, floor, agv_name)
+                # [V42 Change] execute_real_shuffle performs the move physically
+                success, new_t, new_pos = shuffler.execute_real_shuffle(
+                    curr, target, w_evt, t, floor, agv_name, astar, res_table, self.write_move_events, self.base_time
+                )
                 if success:
-                    t += int(penalty)
+                    t = new_t
+                    curr = new_pos # AGV has moved to buffer and dropped off blocker
+                    # Continue loop to replan from buffer to original target
                     continue 
             
+            # Tunneling
             if not path and (t - start_wait > 30):
                  path, _ = astar.find_path(curr, target, t, is_loaded=loaded, ignore_dynamic=True, allow_tunneling=True)
                  if path: t += 30 
 
             if path:
-                self.write_move_events(w_evt, path, floor, agv_name, res_table)
+                self.write_move_events(w_evt, path, floor, agv_name.replace("AGV_", ""), res_table)
                 t = path[-1][1]
                 curr = target
             else:
@@ -693,14 +790,15 @@ class AdvancedSimulationRunner:
             
         total_tasks = len(task_queue_2f) + len(task_queue_3f)
         
-        print(f"🎬 開始模擬... (V88: Inventory Consolidation Fix)")
+        print(f"🎬 開始模擬... (V42: Real Physical Shuffle)")
         print(f"   -> 原始訂單: {len(self.all_tasks_raw)} | AGV任務: {total_tasks}")
         
         # Init outputs
         for floor in ['2F', '3F']:
             for sid, info in self.stations.items():
                 if info['floor'] == floor:
-                    w_evt.writerow([self.to_dt(0), self.to_dt(1), floor, f"WS_{sid}", info['pos'][1], info['pos'][0], info['pos'][1], info['pos'][0], 'STATION_STATUS', 'WHITE|IDLE|N'])
+                    display_id = sid.split('_')[1] # WS_2F_1 -> 1
+                    w_evt.writerow([self.to_dt(0), self.to_dt(1), floor, f"WS_{sid}", info['pos'][1], info['pos'][0], info['pos'][1], info['pos'][0], 'STATION_STATUS', f'WHITE|Station {display_id}|N'])
             for agv_id, state in self.agv_state[floor].items():
                 pos = state['pos']
                 w_evt.writerow([self.to_dt(0), self.to_dt(1), floor, f"AGV_{agv_id}", pos[1], pos[0], pos[1], pos[0], 'AGV_MOVE', 'INIT'])
@@ -711,7 +809,6 @@ class AdvancedSimulationRunner:
         queues = {'2F': task_queue_2f, '3F': task_queue_3f}
         astars = {'2F': astar_2f, '3F': astar_3f}
         
-        import sys 
         start_real = time.time()
 
         for floor in ['2F', '3F']:
@@ -784,7 +881,8 @@ class AdvancedSimulationRunner:
                     if tele_2: stats['Visit'] += 1
                     
                     leave_t = current_t + stop['time']
-                    w_evt.writerow([self.to_dt(current_t), self.to_dt(leave_t), floor, f"WS_{target_st}", st_pos[1], st_pos[0], st_pos[1], st_pos[0], 'STATION_STATUS', 'BLUE|BUSY|N'])
+                    st_display = target_st.split('_')[1]
+                    w_evt.writerow([self.to_dt(current_t), self.to_dt(leave_t), floor, f"WS_{target_st}", st_pos[1], st_pos[0], st_pos[1], st_pos[0], 'STATION_STATUS', f'BLUE|St.{st_display}|N'])
                     w_evt.writerow([self.to_dt(current_t), self.to_dt(leave_t), floor, f"AGV_{best_agv}", st_pos[1], st_pos[0], st_pos[1], st_pos[0], 'PICKING', f"Processing"])
                     for t in range(current_t, int(leave_t)): res_table[t].add(st_pos)
                     current_t = int(leave_t)
@@ -835,10 +933,21 @@ class AdvancedSimulationRunner:
                             w_evt.writerow([self.to_dt(current_t), self.to_dt(current_t+1), floor, f"AGV_{best_agv}", park_spot[1], park_spot[0], park_spot[1], park_spot[0], 'PARKING', 'Hidden'])
                             stats['Park'] += 1
 
+                # KPI Logging (Fixed)
                 for raw_o in task['raw_orders']:
                      wid = raw_o.get('WAVE_ID', 'UNK')
                      ttype = 'INBOUND' if 'RECEIVING' in wid else 'OUTBOUND'
-                     w_kpi.writerow([self.to_dt(current_t), ttype, wid, 'N', self.to_dt(current_t).date(), f"WS_{task['stops'][-1]['station']}", 0, 0])
+                     total_wave_count = self.wave_totals.get(wid, 0)
+                     # Deadline default 4h
+                     deadline_dt = self.to_dt(0) + timedelta(hours=4)
+                     
+                     st_label = f"WS_{task['stops'][-1]['station']}" # e.g. WS_2F_1
+                     
+                     w_kpi.writerow([
+                         self.to_dt(current_t), ttype, wid, 'N', 
+                         self.to_dt(current_t).date(), st_label, 
+                         total_wave_count, deadline_dt
+                     ])
 
                 done_count += 1
                 
