@@ -5,13 +5,16 @@ import time
 import heapq
 import csv
 import random
-from collections import defaultdict, deque
+from collections import defaultdict, deque, Counter
 from datetime import datetime, timedelta
 
 BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 LOG_DIR = os.path.join(BASE_DIR, 'logs')
 os.makedirs(LOG_DIR, exist_ok=True)
 
+# ==========================================
+# 1. 物理引擎與路徑規劃 (V40 Standard)
+# ==========================================
 class TimeAwareAStar:
     def __init__(self, grid, reservations_dict, valid_storage_spots):
         self.grid = grid
@@ -120,11 +123,96 @@ class TimeAwareAStar:
         path.reverse()
         return path, path[-1][1]
 
+# ==========================================
+# 2. 訂單處理與任務鏈生成器 (V42 Logic)
+# ==========================================
+class OrderProcessor:
+    def __init__(self, stations_2f, stations_3f):
+        self.stations = {'2F': list(stations_2f.keys()), '3F': list(stations_3f.keys())}
+        self.cust_station_map = {} 
+        
+    def process_wave(self, wave_orders, floor):
+        wave_custs = wave_orders['PARTCUSTID'].unique()
+        available_stations = self.stations.get(floor, [])
+        if not available_stations: return []
+        
+        # Load Balancing
+        for i, cust_id in enumerate(wave_custs):
+            if cust_id not in self.cust_station_map:
+                st_idx = i % len(available_stations)
+                self.cust_station_map[cust_id] = available_stations[st_idx]
+        
+        shelf_tasks = defaultdict(list)
+        
+        for _, row in wave_orders.iterrows():
+            loc = str(row.get('LOC', '')).strip()
+            # LOC should be assigned by now
+            if len(loc) < 9: continue 
+            
+            shelf_id = loc[:9]
+            # 如果沒有面位資料，預設 A
+            face = loc[10] if len(loc) > 10 else 'A'
+            
+            cust_id = row.get('PARTCUSTID')
+            target_st = self.cust_station_map.get(cust_id)
+            if not target_st: target_st = random.choice(available_stations)
+            
+            shelf_tasks[shelf_id].append({
+                'face': face,
+                'station': target_st,
+                'sku': f"{row.get('FRCD','')}_{row.get('PARTNO','')}",
+                'qty': row.get('QTY', 1),
+                'order_row': row
+            })
+            
+        final_tasks = []
+        for shelf_id, orders in shelf_tasks.items():
+            orders.sort(key=lambda x: (x['station'], x['face']))
+            stops = []
+            current_st = None
+            current_face = None
+            current_sku_group = defaultdict(int) 
+            
+            for o in orders:
+                st = o['station']
+                face = o['face']
+                sku = o['sku']
+                
+                if (st != current_st or face != current_face) and current_st is not None:
+                    proc_time = self._calc_time(current_sku_group)
+                    stops.append({'station': current_st, 'face': current_face, 'time': proc_time})
+                    current_sku_group = defaultdict(int)
+                
+                current_st = st
+                current_face = face
+                current_sku_group[sku] += 1
+            
+            if current_st is not None:
+                proc_time = self._calc_time(current_sku_group)
+                stops.append({'station': current_st, 'face': current_face, 'time': proc_time})
+                
+            final_tasks.append({
+                'shelf_id': shelf_id,
+                'stops': stops,
+                'wave_id': orders[0]['order_row'].get('WAVE_ID'),
+                'raw_orders': [o['order_row'] for o in orders]
+            })
+            
+        return final_tasks
+
+    def _calc_time(self, sku_group):
+        total_time = 0
+        for sku, count in sku_group.items():
+            total_time += 15 + (count * 5)
+        return total_time
+
+# ==========================================
+# 3. 模擬核心 (Advanced Runner V44: Smart Assign)
+# ==========================================
 class AdvancedSimulationRunner:
     def __init__(self):
-        print(f"🚀 [Step 4] 啟動進階模擬 (V41: Missing Variable Fix)...")
+        print(f"🚀 [Step 4] 啟動進階模擬 (V45: Case-Insensitive Inventory Fix)...")
         
-        self.PICK_TIME = 20
         self.grid_2f = self._load_map_correct('2F_map.xlsx', 32, 61)
         self.grid_3f = self._load_map_correct('3F_map.xlsx', 32, 61)
         
@@ -142,12 +230,16 @@ class AdvancedSimulationRunner:
                 self.shelf_occupancy[f].add(p)
                 self.valid_storage_spots[f].add(p)
             
-        print(f"   -> 2F 有效儲位: {len(self.valid_storage_spots['2F'])}")
-        print(f"   -> 3F 有效儲位: {len(self.valid_storage_spots['3F'])}")
-            
-        self.inventory_map = self._load_inventory()
-        self.orders = self._load_all_tasks()
+        self.inventory_map = self._load_inventory() # Map: Part -> [Locs]
+        self.all_tasks_raw = self._load_all_tasks()
+        
+        # [V44] 智慧分配儲位
+        self._assign_locations_smartly(self.all_tasks_raw)
+        
         self.stations = self._init_stations()
+        st_2f = {k:v for k,v in self.stations.items() if v['floor']=='2F'}
+        st_3f = {k:v for k,v in self.stations.items() if v['floor']=='3F'}
+        self.processor = OrderProcessor(st_2f, st_3f)
         
         print("   -> 初始化車隊...")
         self.used_spots_2f = set()
@@ -160,12 +252,127 @@ class AdvancedSimulationRunner:
         
         self.wave_totals = {}
         self.recv_totals = {}
-        for o in self.orders:
+        for o in self.all_tasks_raw:
             wid = str(o.get('WAVE_ID', 'UNKNOWN')) 
             d_str = o['datetime'].strftime('%Y-%m-%d')
             if 'RECEIVING' in wid: self.recv_totals[d_str] = self.recv_totals.get(d_str, 0) + 1
             else: self.wave_totals[wid] = self.wave_totals.get(wid, 0) + 1
 
+    # --- Data Loading & Smart Assignment ---
+    def _load_inventory(self):
+        path = os.path.join(BASE_DIR, 'data', 'master', 'item_inventory.csv')
+        inv = defaultdict(list)
+        try:
+            # [V45 Fix] Case-insensitive column search
+            df = pd.read_csv(path, dtype=str)
+            cols = [c.upper() for c in df.columns]
+            df.columns = cols # 強制轉大寫
+            
+            part_col = next((c for c in cols if 'PART' in c), None)
+            cell_col = next((c for c in cols if 'CELL' in c or 'LOC' in c), None)
+            
+            if part_col and cell_col:
+                for _, r in df.iterrows():
+                    part = str(r[part_col]).strip()
+                    loc = str(r[cell_col]).strip()
+                    if loc: inv[part].append(loc)
+            print(f"   -> Inventory Loaded: {len(inv)} items")
+        except Exception as e: 
+            print(f"⚠️ Inventory Load Error: {e}")
+        return inv
+
+    def _load_all_tasks(self):
+        tasks = []
+        path_out = os.path.join(BASE_DIR, 'data', 'transaction', 'wave_orders.csv')
+        try:
+            df_out = pd.read_csv(path_out)
+            df_out['datetime'] = pd.to_datetime(df_out['datetime'])
+            df_out = df_out.dropna(subset=['datetime'])
+            
+            # 確保欄位名大寫，避免大小寫問題
+            df_out.columns = [c.upper() for c in df_out.columns]
+            
+            if 'LOC' not in df_out.columns: df_out['LOC'] = ''
+            tasks.extend(df_out.to_dict('records'))
+        except: pass
+        
+        path_in = os.path.join(BASE_DIR, 'data', 'transaction', 'historical_receiving_ex.csv')
+        try:
+            df_in = pd.read_csv(path_in)
+            # 強制大寫
+            df_in.columns = [c.upper() for c in df_in.columns]
+            
+            cols = df_in.columns
+            date_col = next((c for c in cols if 'DATE' in c), None)
+            part_col = next((c for c in cols if 'ITEM' in c or 'PART' in c), None)
+            if date_col and part_col:
+                df_in['datetime'] = pd.to_datetime(df_in[date_col])
+                df_in = df_in.dropna(subset=['datetime'])
+                df_in['PARTNO'] = df_in[part_col]
+                df_in['WAVE_ID'] = 'RECEIVING_' + df_in['datetime'].dt.strftime('%Y%m%d')
+                df_in['PARTCUSTID'] = 'REC_VENDOR'
+                if 'LOC' not in df_in.columns: df_in['LOC'] = ''
+                tasks.extend(df_in.to_dict('records'))
+        except: pass
+        
+        tasks.sort(key=lambda x: x['datetime'])
+        return tasks
+
+    def _assign_locations_smartly(self, tasks):
+        print("   -> Running Smart Shelf Assignment (Maximizing Batching)...")
+        # 1. 統計目前已知的料架需求熱度 (Shelf Demand Heatmap)
+        shelf_demand = Counter()
+        
+        # 預先掃描有 LOC 的任務
+        for t in tasks:
+            if t['LOC'] and len(str(t['LOC'])) >= 9:
+                sid = str(t['LOC'])[:9]
+                shelf_demand[sid] += 1
+        
+        assigned_count = 0
+        failed_count = 0
+        
+        # 2. 分配
+        for t in tasks:
+            # Skip if already has valid LOC
+            if t['LOC'] and len(str(t['LOC'])) >= 9: continue
+            
+            part = str(t.get('PARTNO', '')).strip()
+            candidates = self.inventory_map.get(part, [])
+            
+            if not candidates:
+                failed_count += 1
+                continue
+                
+            # 智慧選擇：優先選擇「目前需求最高」的料架
+            # 這樣可以讓同一個料架一次處理更多 SKU
+            best_loc = None
+            max_score = -1
+            
+            for loc in candidates:
+                if len(loc) < 9: continue
+                sid = loc[:9]
+                score = shelf_demand[sid]
+                
+                if score > max_score:
+                    max_score = score
+                    best_loc = loc
+            
+            # 如果都沒人選過 (score=0)，就選第一個
+            if best_loc:
+                # 確保格式正確 (補面位)
+                if len(best_loc) == 9: best_loc += "-A-A01"
+                
+                t['LOC'] = best_loc
+                shelf_demand[best_loc[:9]] += 1
+                assigned_count += 1
+            else:
+                failed_count += 1
+                
+        print(f"   -> Assigned: {assigned_count}, Failed: {failed_count} (Check Inventory Map)")
+
+    # ... [Keep previous Helper Functions: _get_strict_spawn_spot, _find_nearest_valid_storage, _load_map_correct, _load_shelf_coords, _init_stations, write_move_events, _cleanup_reservations, _generate_fallback_path, smart_move, _execute_obstacle_clearing, _find_accessible_buffer] ...
+    # 請保持 V40 的物理引擎邏輯不變
     def _get_strict_spawn_spot(self, grid, used_spots, floor):
         rows, cols = grid.shape
         candidates = []
@@ -213,49 +420,6 @@ class AdvancedSimulationRunner:
                 coords[str(r['shelf_id'])] = {'floor': r['floor'], 'pos': (int(r['x']), int(r['y']))}
         except: pass
         return coords
-    
-    def _load_inventory(self):
-        path = os.path.join(BASE_DIR, 'data', 'master', 'item_inventory.csv')
-        inv = {}
-        try:
-            df = pd.read_csv(path, dtype=str)
-            cols = df.columns
-            part_col = next((c for c in cols if 'PART' in c), None)
-            cell_col = next((c for c in cols if 'CELL' in c or 'LOC' in c), None)
-            if part_col and cell_col:
-                for _, r in df.iterrows():
-                    inv.setdefault(str(r[part_col]).strip(), []).append(str(r[cell_col]).strip()[:7])
-        except: pass
-        return inv
-
-    def _load_all_tasks(self):
-        tasks = []
-        path_out = os.path.join(BASE_DIR, 'data', 'transaction', 'wave_orders.csv')
-        try:
-            df_out = pd.read_csv(path_out)
-            df_out['datetime'] = pd.to_datetime(df_out['datetime'])
-            df_out = df_out.dropna(subset=['datetime'])
-            if 'WAVE_DEADLINE' in df_out.columns:
-                df_out['WAVE_DEADLINE'] = pd.to_datetime(df_out['WAVE_DEADLINE'], errors='coerce')
-            tasks.extend(df_out.to_dict('records'))
-        except: pass
-        
-        path_in = os.path.join(BASE_DIR, 'data', 'transaction', 'historical_receiving_ex.csv')
-        try:
-            df_in = pd.read_csv(path_in)
-            cols = df_in.columns
-            date_col = next((c for c in cols if 'DATE' in c), None)
-            part_col = next((c for c in cols if 'ITEM' in c or 'PART' in c), None)
-            if date_col and part_col:
-                df_in['datetime'] = pd.to_datetime(df_in[date_col])
-                df_in = df_in.dropna(subset=['datetime'])
-                df_in['PARTNO'] = df_in[part_col]
-                df_in['WAVE_ID'] = 'RECEIVING_' + df_in['datetime'].dt.strftime('%Y%m%d')
-                df_in['WAVE_DEADLINE'] = pd.NaT 
-                tasks.extend(df_in.to_dict('records'))
-        except: pass
-        tasks.sort(key=lambda x: x['datetime'])
-        return tasks
 
     def _init_stations(self):
         sts = {}
@@ -271,34 +435,6 @@ class AdvancedSimulationRunner:
                     count += 1; sts[count] = {'floor': '3F', 'pos': (r,c), 'free_time': 0}
         if not sts: sts[1] = {'floor': '2F', 'pos': (5,5), 'free_time': 0}
         return sts
-
-    def get_best_target(self, order, st_ref_2f, st_ref_3f):
-        part = str(order.get('PARTNO', '')).strip()
-        candidates = self.inventory_map.get(part, [])
-        valid_targets = []
-        for sid in candidates:
-            if sid in self.shelf_coords: 
-                pos = self.shelf_coords[sid]['pos']
-                if 0 <= pos[0] < 32 and 0 <= pos[1] < 61:
-                    valid_targets.append((sid, self.shelf_coords[sid]))
-        if not valid_targets and self.shelf_coords:
-            all_sids = list(self.shelf_coords.keys())
-            random.shuffle(all_sids)
-            for sid in all_sids:
-                pos = self.shelf_coords[sid]['pos']
-                if 0 <= pos[0] < 32 and 0 <= pos[1] < 61:
-                    valid_targets.append((sid, self.shelf_coords[sid]))
-                    break
-        if not valid_targets: return None, None
-        best_tgt = None
-        best_sid = None
-        min_dist = float('inf')
-        for sid, tgt in valid_targets:
-            f = tgt['floor']
-            st_pos = st_ref_2f if f == '2F' else st_ref_3f
-            dist = abs(tgt['pos'][0] - st_pos[0]) + abs(tgt['pos'][1] - st_pos[1])
-            if dist < min_dist: min_dist = dist; best_tgt = tgt; best_sid = sid
-        return best_sid, best_tgt
 
     def write_move_events(self, writer, path, floor, agv_id, res_table):
         if not path or len(path) < 2: return
@@ -333,6 +469,7 @@ class AdvancedSimulationRunner:
         path = []
         curr = list(start)
         t = start_time
+        path.append((start, t))
         while curr[0] != end[0]:
             curr[0] += 1 if end[0] > curr[0] else -1
             t += 1
@@ -345,7 +482,6 @@ class AdvancedSimulationRunner:
 
     def smart_move(self, agv_id, start_pos, target_pos, floor, start_time, w_evt, res_table, astar, is_loaded_mode):
         path, _ = astar.find_path(start_pos, target_pos, start_time, is_loaded=is_loaded_mode)
-        
         if path:
             self.write_move_events(w_evt, path, floor, agv_id, res_table)
             return path[-1][1]
@@ -370,10 +506,7 @@ class AdvancedSimulationRunner:
         current_t = start_time
         
         if is_carrying_main_shelf:
-            w_evt.writerow([
-                self.to_dt(current_t), self.to_dt(current_t+5), floor, f"AGV_{agv_id}",
-                target_pos[1], target_pos[0], target_pos[1], target_pos[0], 'SHELF_UNLOAD', 'Temp Drop'
-            ])
+            w_evt.writerow([self.to_dt(current_t), self.to_dt(current_t+5), floor, f"AGV_{agv_id}", target_pos[1], target_pos[0], target_pos[1], target_pos[0], 'SHELF_UNLOAD', 'Temp Drop'])
             current_t += 5
             self.shelf_occupancy[floor].add(target_pos)
         
@@ -385,10 +518,7 @@ class AdvancedSimulationRunner:
         
         if not blocking_neighbors:
             if is_carrying_main_shelf:
-                w_evt.writerow([
-                    self.to_dt(current_t), self.to_dt(current_t+5), floor, f"AGV_{agv_id}",
-                    target_pos[1], target_pos[0], target_pos[1], target_pos[0], 'SHELF_LOAD', 'Reload'
-                ])
+                w_evt.writerow([self.to_dt(current_t), self.to_dt(current_t+5), floor, f"AGV_{agv_id}", target_pos[1], target_pos[0], target_pos[1], target_pos[0], 'SHELF_LOAD', 'Reload'])
                 current_t += 5
                 self.shelf_occupancy[floor].remove(target_pos)
             return current_t
@@ -398,54 +528,57 @@ class AdvancedSimulationRunner:
         
         if not buffer_pos: 
             if is_carrying_main_shelf:
-                w_evt.writerow([
-                    self.to_dt(current_t), self.to_dt(current_t+5), floor, f"AGV_{agv_id}",
-                    target_pos[1], target_pos[0], target_pos[1], target_pos[0], 'SHELF_LOAD', 'Deadlock'
-                ])
+                w_evt.writerow([self.to_dt(current_t), self.to_dt(current_t+5), floor, f"AGV_{agv_id}", target_pos[1], target_pos[0], target_pos[1], target_pos[0], 'SHELF_LOAD', 'Deadlock'])
                 current_t += 5
                 self.shelf_occupancy[floor].remove(target_pos)
             return current_t + 60
 
         current_t = self.smart_move(agv_id, target_pos, obstacle_to_move, floor, current_t, w_evt, res_table, astar, is_loaded_mode=False)
-        
-        w_evt.writerow([
-            self.to_dt(current_t), self.to_dt(current_t+5), floor, f"AGV_{agv_id}",
-            obstacle_to_move[1], obstacle_to_move[0], obstacle_to_move[1], obstacle_to_move[0], 'SHELF_LOAD', 'Clear Obs'
-        ])
+        w_evt.writerow([self.to_dt(current_t), self.to_dt(current_t+5), floor, f"AGV_{agv_id}", obstacle_to_move[1], obstacle_to_move[0], obstacle_to_move[1], obstacle_to_move[0], 'SHELF_LOAD', 'Clear Obs'])
         current_t += 5
         self.shelf_occupancy[floor].remove(obstacle_to_move)
         
         current_t = self.smart_move(agv_id, obstacle_to_move, buffer_pos, floor, current_t, w_evt, res_table, astar, is_loaded_mode=True)
-        
-        w_evt.writerow([
-            self.to_dt(current_t), self.to_dt(current_t+5), floor, f"AGV_{agv_id}",
-            buffer_pos[1], buffer_pos[0], buffer_pos[1], buffer_pos[0], 'SHELF_UNLOAD', ''
-        ])
+        w_evt.writerow([self.to_dt(current_t), self.to_dt(current_t+5), floor, f"AGV_{agv_id}", buffer_pos[1], buffer_pos[0], buffer_pos[1], buffer_pos[0], 'SHELF_UNLOAD', ''])
         current_t += 5
         self.shelf_occupancy[floor].add(buffer_pos)
         
-        found_sid = None
         for sid, info in self.shelf_coords.items():
-            if info['floor'] == floor and info['pos'] == obstacle_to_move:
-                found_sid = sid; break
-        if found_sid: self.shelf_coords[found_sid]['pos'] = buffer_pos
+            if info['floor'] == floor and info['pos'] == obstacle_to_move: self.shelf_coords[sid]['pos'] = buffer_pos; break
         
         current_t = self.smart_move(agv_id, buffer_pos, target_pos, floor, current_t, w_evt, res_table, astar, is_loaded_mode=False)
         
         if is_carrying_main_shelf:
-            w_evt.writerow([
-                self.to_dt(current_t), self.to_dt(current_t+5), floor, f"AGV_{agv_id}",
-                target_pos[1], target_pos[0], target_pos[1], target_pos[0], 'SHELF_LOAD', 'Reload Main'
-            ])
+            w_evt.writerow([self.to_dt(current_t), self.to_dt(current_t+5), floor, f"AGV_{agv_id}", target_pos[1], target_pos[0], target_pos[1], target_pos[0], 'SHELF_LOAD', 'Reload Main'])
             current_t += 5
             self.shelf_occupancy[floor].remove(target_pos)
             
         self.agv_state[floor][int(agv_id)]['pos'] = target_pos
         return current_t
 
+    def _find_accessible_buffer(self, start_pos, grid, occupied_spots, astar, start_time):
+        rows, cols = grid.shape
+        q = deque([(start_pos, 0)])
+        visited = {start_pos}
+        while q:
+            curr, dist = q.popleft()
+            if dist > 10: break
+            r, c = curr
+            is_valid_spot = (grid[r][c] == 0) or (grid[r][c] == 1 and curr not in occupied_spots)
+            if is_valid_spot and curr != start_pos:
+                path, _ = astar.find_path(start_pos, curr, start_time, is_loaded=True)
+                if path: return curr
+            for dr, dc in [(0,1),(0,-1),(1,0),(-1,0)]:
+                nr, nc = r+dr, c+dc
+                if 0<=nr<rows and 0<=nc<cols and (nr,nc) not in visited: visited.add((nr,nc)); q.append(((nr,nc), dist+1))
+        return None
+
     def run(self):
-        if not self.orders: return
-        self.base_time = self.orders[0]['datetime']
+        if not self.all_tasks_raw: 
+            print("❌ No valid tasks found after processing. Check data mapping.")
+            return
+            
+        self.base_time = self.all_tasks_raw[0]['datetime']
         self.to_dt = lambda sec: self.base_time + timedelta(seconds=sec)
         def to_sec(dt): return int((dt - self.base_time).total_seconds())
         
@@ -459,154 +592,121 @@ class AdvancedSimulationRunner:
         w_kpi = csv.writer(f_kpi)
         w_kpi.writerow(['finish_time', 'type', 'wave_id', 'is_delayed', 'date', 'workstation', 'total_in_wave', 'deadline_ts'])
 
-        count = 0
-        total_orders = len(self.orders)
-        print(f"🎬 開始模擬 {total_orders} 筆訂單...")
+        print(f"🎬 開始模擬... (Task Chaining Activated)")
+        print(f"   -> Effective Orders: {len(self.all_tasks_raw)}")
         start_real = time.time()
         
         for floor in ['2F', '3F']:
             for agv_id, state in self.agv_state[floor].items():
                 pos = state['pos']
-                w_evt.writerow([
-                    self.to_dt(0), self.to_dt(1), floor, f"AGV_{agv_id}",
-                    pos[1], pos[0], pos[1], pos[0], 'AGV_MOVE', 'INIT'
-                ])
+                w_evt.writerow([self.to_dt(0), self.to_dt(1), floor, f"AGV_{agv_id}", pos[1], pos[0], pos[1], pos[0], 'AGV_MOVE', 'INIT'])
 
-        def find_first_st(floor):
-            for sid, info in self.stations.items():
-                if info['floor'] == floor: return info['pos']
-            return (0,0)
-        st_ref_2f = find_first_st('2F')
-        st_ref_3f = find_first_st('3F')
-
-        for order in self.orders:
-            if pd.isna(order.get('datetime')): continue
-            order_start_sec = to_sec(order['datetime'])
+        df_tasks = pd.DataFrame(self.all_tasks_raw)
+        grouped_waves = df_tasks.groupby('WAVE_ID')
+        
+        task_queue_2f = deque()
+        task_queue_3f = deque()
+        
+        print("   -> Generating Task Chains...")
+        for wave_id, wave_df in grouped_waves:
+            wave_2f = wave_df[wave_df['LOC'].str.startswith('2')].copy()
+            wave_3f = wave_df[wave_df['LOC'].str.startswith('3')].copy()
             
-            target_id, target = self.get_best_target(order, st_ref_2f, st_ref_3f)
-            if not target: count += 1; continue
+            tasks_2f = self.processor.process_wave(wave_2f, '2F')
+            tasks_3f = self.processor.process_wave(wave_3f, '3F')
             
-            floor = target['floor']
-            shelf_pos = target['pos']
+            task_queue_2f.extend(tasks_2f)
+            task_queue_3f.extend(tasks_3f)
             
+        print(f"   -> Tasks: 2F={len(task_queue_2f)}, 3F={len(task_queue_3f)}")
+        
+        total_tasks = len(task_queue_2f) + len(task_queue_3f)
+        done_count = 0
+        
+        queues = {'2F': task_queue_2f, '3F': task_queue_3f}
+        astars = {'2F': astar_2f, '3F': astar_3f}
+        
+        for floor in ['2F', '3F']:
+            queue = queues[floor]
+            astar = astars[floor]
             agv_pool = self.agv_state[floor]
-            best_agv = min(agv_pool, key=lambda k: agv_pool[k]['time'])
-            agv_ready_sec = agv_pool[best_agv]['time']
-            agv_curr_pos = agv_pool[best_agv]['pos']
+            res_table = self.reservations_2f if floor=='2F' else self.reservations_3f
             
-            valid_st = [sid for sid, info in self.stations.items() if info['floor'] == floor]
-            if not valid_st: valid_st = list(self.stations.keys())
-            st_pool = {sid: self.stations[sid]['free_time'] for sid in valid_st}
-            best_st = min(st_pool, key=st_pool.get)
-            st_ready_sec = self.stations[best_st]['free_time']
-            st_pos = self.stations[best_st]['pos']
-            
-            start_sec = max(order_start_sec, agv_ready_sec, st_ready_sec)
-            
-            static_blockers = set()
-            for agv_id, state in agv_pool.items():
-                if agv_id != best_agv and state['time'] <= start_sec:
-                    static_blockers.add(state['pos'])
-            
-            astar = astar_2f if floor == '2F' else astar_3f
-            res_table = self.reservations_2f if floor == '2F' else self.reservations_3f
-            
-            # --- 1. 取貨 (Empty) ---
-            current_t = self.smart_move(best_agv, agv_curr_pos, shelf_pos, floor, start_sec, w_evt, res_table, astar, is_loaded_mode=False)
-            self.agv_state[floor][best_agv]['pos'] = shelf_pos
+            while queue:
+                task = queue.popleft()
+                best_agv = min(agv_pool, key=lambda k: agv_pool[k]['time'])
+                agv_ready_time = agv_pool[best_agv]['time']
+                
+                shelf_id = task['shelf_id']
+                if shelf_id not in self.shelf_coords: 
+                    done_count += 1; continue
+                    
+                shelf_pos = self.shelf_coords[shelf_id]['pos']
+                
+                # Task Start
+                current_t = agv_ready_time
+                agv_pos = agv_pool[best_agv]['pos']
+                
+                # Step A: Move to Shelf
+                current_t = self.smart_move(best_agv, agv_pos, shelf_pos, floor, current_t, w_evt, res_table, astar, is_loaded_mode=False)
+                
+                # Load Shelf
+                w_evt.writerow([self.to_dt(current_t), self.to_dt(current_t+5), floor, f"AGV_{best_agv}", shelf_pos[1], shelf_pos[0], shelf_pos[1], shelf_pos[0], 'SHELF_LOAD', f"Task_{done_count}"])
+                current_t += 5
+                if shelf_pos in self.shelf_occupancy[floor]: self.shelf_occupancy[floor].remove(shelf_pos)
+                
+                current_shelf_pos = shelf_pos
+                
+                # Step B: Stops
+                for stop in task['stops']:
+                    target_st = stop['station']
+                    st_pos = self.stations[target_st]['pos']
+                    proc_time = stop['time']
+                    
+                    if current_shelf_pos == st_pos:
+                        # Face Change (Micro Move)
+                        buffer_pos = self._find_accessible_buffer(st_pos, self.grid_2f if floor=='2F' else self.grid_3f, self.shelf_occupancy[floor], astar, current_t)
+                        if not buffer_pos: buffer_pos = (st_pos[0]+1, st_pos[1])
+                        
+                        current_t = self.smart_move(best_agv, st_pos, buffer_pos, floor, current_t, w_evt, res_table, astar, is_loaded_mode=True)
+                        current_t = self.smart_move(best_agv, buffer_pos, st_pos, floor, current_t, w_evt, res_table, astar, is_loaded_mode=True)
+                    else:
+                        current_t = self.smart_move(best_agv, current_shelf_pos, st_pos, floor, current_t, w_evt, res_table, astar, is_loaded_mode=True)
+                    
+                    current_shelf_pos = st_pos
+                    
+                    # Process
+                    leave_t = current_t + proc_time
+                    w_evt.writerow([self.to_dt(current_t), self.to_dt(leave_t), floor, f"WS_{target_st}", st_pos[1], st_pos[0], st_pos[1], st_pos[0], 'STATION_STATUS', 'BLUE|BUSY|N'])
+                    w_evt.writerow([self.to_dt(current_t), self.to_dt(leave_t), floor, f"AGV_{best_agv}", st_pos[1], st_pos[0], st_pos[1], st_pos[0], 'PICKING', f"Processing"])
+                    
+                    for t in range(current_t, int(leave_t)): res_table[t].add(st_pos)
+                    current_t = int(leave_t)
+                
+                # Step C: Return
+                candidates = self._find_nearest_valid_storage(current_shelf_pos, self.valid_storage_spots[floor], {s['pos'] for k,s in agv_pool.items()}, self.shelf_occupancy[floor])
+                if not candidates: candidates = [shelf_pos]
+                drop_pos = candidates[0]
+                
+                current_t = self.smart_move(best_agv, current_shelf_pos, drop_pos, floor, current_t, w_evt, res_table, astar, is_loaded_mode=True)
+                
+                w_evt.writerow([self.to_dt(current_t), self.to_dt(current_t+5), floor, f"AGV_{best_agv}", drop_pos[1], drop_pos[0], drop_pos[1], drop_pos[0], 'SHELF_UNLOAD', 'Done'])
+                current_t += 5
+                
+                self.shelf_occupancy[floor].add(drop_pos)
+                self.shelf_coords[shelf_id]['pos'] = drop_pos
+                self.agv_state[floor][best_agv]['pos'] = drop_pos
+                self.agv_state[floor][best_agv]['time'] = current_t
+                
+                for raw_o in task['raw_orders']:
+                    wid = raw_o.get('WAVE_ID', 'UNK')
+                    ttype = 'INBOUND' if 'RECEIVING' in wid else 'OUTBOUND'
+                    w_kpi.writerow([self.to_dt(current_t), ttype, wid, 'N', self.to_dt(current_t).date(), f"WS_{task['stops'][-1]['station']}", 0, 0])
 
-            w_evt.writerow([
-                self.to_dt(current_t), self.to_dt(current_t+5), floor, f"AGV_{best_agv}",
-                shelf_pos[1], shelf_pos[0], shelf_pos[1], shelf_pos[0], 'SHELF_LOAD', ''
-            ])
-            current_t += 5
-            if shelf_pos in self.shelf_occupancy[floor]:
-                self.shelf_occupancy[floor].remove(shelf_pos)
-
-            # --- 2. 搬運 (Loaded) ---
-            arrive_st_sec = self.smart_move(best_agv, shelf_pos, st_pos, floor, current_t, w_evt, res_table, astar, is_loaded_mode=True)
-            self.agv_state[floor][best_agv]['pos'] = st_pos
-            
-            # --- 3. 作業 ---
-            leave_st_sec = arrive_st_sec + self.PICK_TIME
-            for t in range(arrive_st_sec, leave_st_sec):
-                res_table[t].add((st_pos[0], st_pos[1]))
-            
-            task_type = 'OUTBOUND'
-            wave_id = str(order.get('WAVE_ID', 'UNKNOWN'))
-            if 'RECEIVING' in wave_id: task_type = 'INBOUND'
-            elif 'REPLENISH' in wave_id: task_type = 'REPLENISH'
-            
-            # [Fix] 補回 status_color 定義
-            status_color = 'BLUE' 
-            if task_type == 'INBOUND': status_color = 'GREEN'
-            if task_type == 'REPLENISH': status_color = 'ORANGE'
-            
-            is_delayed = 'N'
-            deadline = order.get('WAVE_DEADLINE')
-            deadline_ts = 0
-            if pd.notna(deadline) and isinstance(deadline, (pd.Timestamp, datetime)):
-                 deadline_ts = int(deadline.timestamp())
-            
-            status_text = f"{status_color}|{wave_id}|{is_delayed}"
-            w_evt.writerow([
-                self.to_dt(arrive_st_sec), self.to_dt(leave_st_sec), floor, f"WS_{best_st}",
-                st_pos[1], st_pos[0], st_pos[1], st_pos[0], 'STATION_STATUS', status_text
-            ])
-            w_evt.writerow([
-                self.to_dt(arrive_st_sec), self.to_dt(leave_st_sec), floor, f"AGV_{best_agv}",
-                st_pos[1], st_pos[0], st_pos[1], st_pos[0], 'PICKING', f"Order_{count}"
-            ])
-
-            # --- 4. 歸還 (Loaded) ---
-            candidate_spots = self._find_nearest_valid_storage(
-                st_pos, 
-                self.valid_storage_spots[floor], 
-                {s['pos'] for k, s in agv_pool.items() if k != best_agv}, 
-                self.shelf_occupancy[floor], 
-                limit=5
-            )
-            if not candidate_spots: candidate_spots = [shelf_pos]
-            drop_pos = candidate_spots[0]
-            
-            finish_sec = self.smart_move(best_agv, st_pos, drop_pos, floor, leave_st_sec, w_evt, res_table, astar, is_loaded_mode=True)
-            
-            w_evt.writerow([
-                self.to_dt(finish_sec), self.to_dt(finish_sec+5), floor, f"AGV_{best_agv}",
-                drop_pos[1], drop_pos[0], drop_pos[1], drop_pos[0], 'SHELF_UNLOAD', ''
-            ])
-            finish_sec += 5
-
-            self.shelf_occupancy[floor].add(drop_pos)
-            if target_id:
-                self.shelf_coords[target_id]['pos'] = drop_pos
-
-            self.agv_state[floor][best_agv]['time'] = finish_sec
-            self.agv_state[floor][best_agv]['pos'] = drop_pos
-            self.stations[best_st]['free_time'] = leave_st_sec
-            
-            if deadline_ts > 0 and self.to_dt(finish_sec) > deadline:
-                is_delayed = 'Y'
-            
-            total_in_wave = 0
-            if task_type == 'INBOUND':
-                d_str = order['datetime'].strftime('%Y-%m-%d')
-                total_in_wave = self.recv_totals.get(d_str, 0)
-            else:
-                total_in_wave = self.wave_totals.get(wave_id, 0)
-            
-            w_kpi.writerow([
-                self.to_dt(finish_sec), 'PICKING' if task_type=='OUTBOUND' else 'RECEIVING', wave_id,
-                is_delayed, self.to_dt(finish_sec).date(), f"WS_{best_st}", total_in_wave, deadline_ts
-            ])
-            
-            count += 1
-            if count % 20 == 0:
-                print(f"\r🚀 進度: {count}/{total_orders} (Time: {time.time()-start_real:.1f}s)", end='')
-            
-            if count % 200 == 0:
-                self._cleanup_reservations(self.reservations_2f, start_sec)
-                self._cleanup_reservations(self.reservations_3f, start_sec)
+                done_count += 1
+                if done_count % 50 == 0:
+                    print(f"\r🚀 進度: {done_count}/{total_tasks} Tasks (Time: {time.time()-start_real:.1f}s)", end='')
+                    self._cleanup_reservations(res_table, current_t)
 
         f_evt.close()
         f_kpi.close()
