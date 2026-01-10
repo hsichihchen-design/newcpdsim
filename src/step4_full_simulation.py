@@ -26,7 +26,6 @@ class TimeAwareAStar:
     def find_path(self, start, goal, start_time_sec, static_blockers=None):
         if start == goal: return [(start, start_time_sec)], start_time_sec
         if not (0 <= start[0] < self.rows and 0 <= start[1] < self.cols): return None, None
-        if not (0 <= goal[0] < self.rows and 0 <= goal[1] < self.cols): return None, None
         
         if static_blockers is None: static_blockers = set()
 
@@ -45,7 +44,11 @@ class TimeAwareAStar:
         TURNING_COST = 2.0   
         WAIT_COST = 1.5      
         HEURISTIC_WEIGHT = 2.5 
-        CHECK_HORIZON = 20 
+        HORIZON_LIMIT = 20 
+
+        # 記錄最佳路徑點 (用於半路返回)
+        best_node = None
+        min_h = float('inf')
 
         while open_set:
             steps += 1
@@ -53,18 +56,12 @@ class TimeAwareAStar:
             
             f, h, current_time, current, last_move = heapq.heappop(open_set)
 
-            if current == goal:
-                path = []
-                curr_node = (current, current_time, last_move)
-                while curr_node in came_from:
-                    pos, t, move = curr_node
-                    path.append((pos, t))
-                    curr_node = came_from[curr_node]
-                path.append((start, start_time_sec)) 
-                path.reverse()
-                return path, current_time
+            if h < min_h:
+                min_h = h
+                best_node = (current, current_time, last_move)
 
-            current_g = g_score[(current, current_time, last_move)]
+            if current == goal:
+                return self._reconstruct_path(came_from, (current, current_time, last_move), start, start_time_sec)
 
             for dr, dc in self.moves:
                 nr, nc = current[0] + dr, current[1] + dc
@@ -76,22 +73,21 @@ class TimeAwareAStar:
                     if (nr, nc) in static_blockers and (nr, nc) != goal and (nr, nc) != start:
                         continue
 
-                    # 2. 地形判斷
+                    # 2. 地形判斷 [CORRECTED LOGIC]
                     val = self.grid[nr][nc]
                     step_cost = NORMAL_COST
                     
-                    # [Fix] -1 絕對不可走
+                    # 只有 -1 是絕對牆壁
                     if val == -1: 
                         step_cost = OBSTACLE_COST
-                    elif val == 1:
-                        # 只有合法儲位才可走
-                        if (nr, nc) in self.valid_storage_spots: step_cost = NORMAL_COST
-                        else:
-                            if (nr, nc) != goal and (nr, nc) != start: step_cost = OBSTACLE_COST
+                    else:
+                        # 0(走道), 1(料架), 2(站), 3(充電) 都是路
+                        step_cost = NORMAL_COST
                     
-                    # 3. 動態防撞 (Horizon)
-                    time_delta = next_time - start_time_sec
-                    if time_delta < CHECK_HORIZON:
+                    if step_cost >= OBSTACLE_COST: continue
+
+                    # 3. 動態防撞
+                    if (next_time - start_time_sec) < HORIZON_LIMIT:
                         if next_time in self.reservations and (nr, nc) in self.reservations[next_time]:
                             continue
                     
@@ -99,9 +95,7 @@ class TimeAwareAStar:
                     if dr == 0 and dc == 0: step_cost += WAIT_COST
                     elif (dr, dc) != last_move and last_move != (0,0): step_cost += TURNING_COST
 
-                    new_g = current_g + step_cost
-                    if step_cost >= OBSTACLE_COST: continue
-
+                    new_g = g_score[(current, current_time, last_move)] + step_cost
                     new_move = (dr, dc)
                     state_key = ((nr, nc), next_time, new_move)
                     
@@ -112,16 +106,29 @@ class TimeAwareAStar:
                         heapq.heappush(open_set, (f, h, next_time, (nr, nc), new_move))
                         came_from[state_key] = (current, current_time, last_move)
                         
+        if best_node:
+            return self._reconstruct_path(came_from, best_node, start, start_time_sec)
         return None, None
+
+    def _reconstruct_path(self, came_from, current_node, start_pos, start_time):
+        path = []
+        curr = current_node
+        while curr in came_from:
+            pos, t, move = curr
+            path.append((pos, t))
+            curr = came_from[curr]
+        path.append((start_pos, start_time))
+        path.reverse()
+        return path, path[-1][1]
 
 class AdvancedSimulationRunner:
     def __init__(self):
-        print(f"🚀 [Step 4] 啟動進階模擬 (V28: The Void is LAVA)...")
+        print(f"🚀 [Step 4] 啟動進階模擬 (V30: Correct Map Logic 32x61)...")
         
         self.PICK_TIME = 20
-        # [Critical Fix] 載入地圖時，空白處填 -1 (障礙)
-        self.grid_2f = self._load_map_strict('2F_map.xlsx', 32, 61)
-        self.grid_3f = self._load_map_strict('3F_map.xlsx', 32, 61)
+        # [Fix] 載入正確地圖邏輯：NaN=0 (路), -1=牆
+        self.grid_2f = self._load_map_correct('2F_map.xlsx', 32, 61)
+        self.grid_3f = self._load_map_correct('3F_map.xlsx', 32, 61)
         
         self.reservations_2f = defaultdict(set)
         self.reservations_3f = defaultdict(set)
@@ -162,7 +169,15 @@ class AdvancedSimulationRunner:
             else: self.wave_totals[wid] = self.wave_totals.get(wid, 0) + 1
 
     def _get_strict_spawn_spot(self, grid, used_spots, floor):
-        candidates = list(self.valid_storage_spots[floor])
+        # 優先在走道(0)出生，如果不行就在儲位(1)
+        rows, cols = grid.shape
+        candidates = []
+        for r in range(rows):
+            for c in range(cols):
+                if grid[r][c] == 0: candidates.append((r,c))
+        
+        if not candidates: candidates = list(self.valid_storage_spots[floor])
+        
         random.shuffle(candidates)
         for cand in candidates:
             if cand not in used_spots:
@@ -179,31 +194,27 @@ class AdvancedSimulationRunner:
         available.sort(key=lambda x: x[0])
         return [x[1] for x in available[:limit]]
 
-    def _load_map_strict(self, filename, rows, cols):
+    def _load_map_correct(self, filename, rows, cols):
         path = os.path.join(BASE_DIR, 'data', 'master', filename)
         if not os.path.exists(path): path = path.replace('.xlsx', '.csv')
         try:
             if filename.endswith('.xlsx'): df = pd.read_excel(path, header=None)
             else: df = pd.read_csv(path, header=None)
-        except: 
-            # 讀不到就全填 -1 (全是牆)
-            return np.full((rows, cols), -1)
+        except: return np.full((rows, cols), 0) # 讀不到就假設全是路
         
+        # 1. 裁切
         df_crop = df.iloc[0:rows, 0:cols]
         
-        # [Ultimate Fix] 空白處填 -1 (障礙)，而不是 0 (路)
-        raw_grid = df_crop.fillna(-1).values
+        # 2. [Critical Fix] 空白 (NaN) 填補為 0 (走道)
+        raw_grid = df_crop.fillna(0).values 
         
-        # 預設全地圖都是 -1 (牆)
-        final_grid = np.full((rows, cols), -1) 
+        # 3. 建立最終地圖 (預設為 -1 牆壁，防止讀取不足)
+        final_grid = np.full((rows, cols), -1.0) 
         
         r_in = min(raw_grid.shape[0], rows)
         c_in = min(raw_grid.shape[1], cols)
-        
-        # 複製有資料的區域
         final_grid[0:r_in, 0:c_in] = raw_grid[0:r_in, 0:c_in]
         
-        print(f"   🗺️  地圖 {filename} 嚴格加載 (空值=-1)")
         return final_grid
 
     def _load_shelf_coords(self):
@@ -283,7 +294,6 @@ class AdvancedSimulationRunner:
                 pos = self.shelf_coords[sid]['pos']
                 if 0 <= pos[0] < 32 and 0 <= pos[1] < 61:
                     valid_targets.append((sid, self.shelf_coords[sid]))
-        
         if not valid_targets and self.shelf_coords:
             all_sids = list(self.shelf_coords.keys())
             random.shuffle(all_sids)
@@ -292,9 +302,7 @@ class AdvancedSimulationRunner:
                 if 0 <= pos[0] < 32 and 0 <= pos[1] < 61:
                     valid_targets.append((sid, self.shelf_coords[sid]))
                     break
-            
         if not valid_targets: return None, None
-
         best_tgt = None
         best_sid = None
         min_dist = float('inf')
@@ -402,8 +410,9 @@ class AdvancedSimulationRunner:
             astar = astar_2f if floor == '2F' else astar_3f
             res_table = self.reservations_2f if floor == '2F' else self.reservations_3f
             
-            # 1. 取貨
+            # --- 1. 取貨 ---
             path_to_shelf, arrive_shelf_sec = astar.find_path(agv_curr_pos, shelf_pos, start_sec, static_blockers)
+            # 因為現在走道通了，應該很少失敗。如果失敗，就瞬移(最後手段)
             if not path_to_shelf:
                 arrive_shelf_sec = start_sec + 300 
                 path_to_shelf = [(agv_curr_pos, start_sec), (shelf_pos, arrive_shelf_sec)]
@@ -412,14 +421,14 @@ class AdvancedSimulationRunner:
             if shelf_pos in self.shelf_occupancy[floor]:
                 self.shelf_occupancy[floor].remove(shelf_pos)
 
-            # 2. 搬運
+            # --- 2. 搬運 ---
             path_to_st, arrive_st_sec = astar.find_path(shelf_pos, st_pos, arrive_shelf_sec)
             if not path_to_st:
                 arrive_st_sec = arrive_shelf_sec + 300
             else:
                 self.write_move_events(w_evt, path_to_st, floor, best_agv, res_table)
                 
-            # 3. 作業
+            # --- 3. 作業 ---
             leave_st_sec = arrive_st_sec + self.PICK_TIME
             for t in range(arrive_st_sec, leave_st_sec):
                 res_table[t].add((st_pos[0], st_pos[1]))
@@ -449,7 +458,7 @@ class AdvancedSimulationRunner:
                 st_pos[1], st_pos[0], st_pos[1], st_pos[0], 'PICKING', f"Order_{count}"
             ])
 
-            # 4. 歸還
+            # --- 4. 歸還 ---
             candidate_spots = self._find_nearest_valid_storage(
                 st_pos, 
                 self.valid_storage_spots[floor], 
@@ -497,7 +506,7 @@ class AdvancedSimulationRunner:
             ])
             
             count += 1
-            if count % 10 == 0:
+            if count % 20 == 0:
                 print(f"\r🚀 進度: {count}/{total_orders} (Time: {time.time()-start_real:.1f}s)", end='')
             
             if count % 200 == 0:

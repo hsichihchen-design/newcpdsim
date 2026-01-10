@@ -10,7 +10,6 @@ LOG_DIR = os.path.join(BASE_DIR, 'logs')
 OUTPUT_HTML = os.path.join(LOG_DIR, 'dashboard_report.html')
 
 def load_map_fixed(filename, rows_limit, cols_limit):
-    # [Fix] 與 Step 4 V24/V25 保持一致，強制裁切
     path = os.path.join(DATA_MAP_DIR, filename)
     df = None
     if os.path.exists(path):
@@ -23,14 +22,9 @@ def load_map_fixed(filename, rows_limit, cols_limit):
             except: pass
     
     if df is not None:
-        # 強制切成 32x61
         df = df.iloc[0:rows_limit, 0:cols_limit]
+        # [Correct] 空值填 0 (路)，-1 才是牆壁
         grid = df.fillna(0).values.tolist()
-        
-        # 轉換數值：-1 改為 1 (視覺化把牆壁視為 1)
-        for r in range(len(grid)):
-            for c in range(len(grid[0])):
-                if grid[r][c] == -1: grid[r][c] = 1
         return grid
     return []
 
@@ -41,23 +35,29 @@ def load_shelf_map():
         try:
             df = pd.read_csv(path)
             for _, r in df.iterrows():
-                # 過濾掉超出範圍的座標 (雖然 Step 4 已經濾過了，這裡雙重保險)
                 if 0 <= r['x'] < 61 and 0 <= r['y'] < 32:
                     shelf_set[r['floor']].add((int(r['x']), int(r['y'])))
         except: pass
     return shelf_set
 
 def main():
-    print("🚀 [Step 5] 啟動視覺化 (V26: Map Sync Fix)...")
+    print("🚀 [Step 5] 啟動視覺化 (V29: Correct Map Visuals)...")
 
-    # [Fix] 強制鎖定 32x61
     map_2f = load_map_fixed('2F_map.xlsx', 32, 61)
     map_3f = load_map_fixed('3F_map.xlsx', 32, 61)
     shelf_data = load_shelf_map()
     
     events_path = os.path.join(LOG_DIR, 'simulation_events.csv')
     if not os.path.exists(events_path): return
-    df_events = pd.read_csv(events_path)
+
+    try:
+        try:
+            df_events = pd.read_csv(events_path, on_bad_lines='skip', engine='python')
+        except TypeError:
+            df_events = pd.read_csv(events_path, error_bad_lines=False, engine='python')
+    except Exception as e:
+        print(f"❌ Error: {e}")
+        return
     
     df_events['start_ts'] = pd.to_datetime(df_events['start_time'], errors='coerce')
     df_events['end_ts'] = pd.to_datetime(df_events['end_time'], errors='coerce')
@@ -73,13 +73,11 @@ def main():
     df_events = df_events.sort_values('start_ts')
     df_events['text'] = df_events['text'].fillna('').astype(str)
     
-    if df_events.empty:
-        print("❌ 錯誤：無有效事件資料。")
-        return
+    if df_events.empty: return
 
     min_time = int(df_events['start_ts'].min())
     max_time = int(df_events['end_ts'].max())
-    print(f"   📅 模擬時間範圍 (Timestamp): {min_time} ~ {max_time}")
+    print(f"   📅 Time: {min_time} ~ {max_time}")
 
     events_data = df_events[['start_ts', 'end_ts', 'floor', 'obj_id', 'sx', 'sy', 'ex', 'ey', 'type', 'text']].values.tolist()
     
@@ -88,7 +86,6 @@ def main():
     try: all_stations.sort(key=lambda x: int(x.split('_')[1]))
     except: pass
 
-    # KPI
     kpi_path = os.path.join(LOG_DIR, 'simulation_kpi.csv')
     kpi_raw = []
     
@@ -97,7 +94,11 @@ def main():
     recv_totals_simple = {} 
 
     try:
-        df_kpi = pd.read_csv(kpi_path)
+        try:
+            df_kpi = pd.read_csv(kpi_path, on_bad_lines='skip', engine='python')
+        except:
+            df_kpi = pd.read_csv(kpi_path, error_bad_lines=False, engine='python')
+
         df_kpi['finish_ts'] = pd.to_datetime(df_kpi['finish_time'], errors='coerce')
         df_kpi = df_kpi.dropna(subset=['finish_ts'])
         df_kpi['date'] = df_kpi['finish_ts'].dt.strftime('%Y-%m-%d')
@@ -113,24 +114,20 @@ def main():
             total = int(row['total_in_wave'])
             wid = str(row['wave_id'])
             deadline = int(row['deadline_ts'])
-            
             if deadline > 0: wave_deadlines[wid] = deadline
-            
             if row['type'] == 'RECEIVING':
                 d = row['date']
                 if total > recv_totals_simple.get(d, 0): recv_totals_simple[d] = total
             else:
                 if total > wave_totals_simple.get(wid, 0): wave_totals_simple[wid] = total
-                
-    except Exception as e:
-        print(f"⚠️ KPI Error: {e}")
+    except: pass
 
     html_template = """
 <!DOCTYPE html>
 <html>
 <head>
     <meta charset="utf-8">
-    <title>Warehouse Monitor V26</title>
+    <title>Warehouse Monitor V29</title>
     <style>
         body { font-family: 'Segoe UI', sans-serif; margin: 0; display: flex; flex-direction: column; height: 100vh; overflow: hidden; background: #eef1f5; }
         .header { background: #fff; height: 40px; padding: 0 20px; display: flex; align-items: center; border-bottom: 1px solid #ddd; flex-shrink: 0; }
@@ -163,7 +160,7 @@ def main():
 </head>
 <body>
     <div class="header">
-        <h3>🏭 倉儲戰情室 (V26)</h3>
+        <h3>🏭 倉儲戰情室 (V29)</h3>
         <div style="flex:1"></div>
         <span id="timeDisplay" style="font-weight: bold;">--</span>
     </div>
@@ -174,7 +171,7 @@ def main():
                 <div style="display:flex;align-items:center"><div class="box" style="background:green"></div>進貨</div>
                 <div style="display:flex;align-items:center"><div class="box" style="background:#8d6e63"></div>料架</div>
                 <div style="display:flex;align-items:center"><div class="box" style="background:#ccc"></div>牆壁</div>
-                <div style="display:flex;align-items:center"><div class="box" style="background:white"></div>空地</div>
+                <div style="display:flex;align-items:center"><div class="box" style="background:white"></div>走道</div>
             </div>
             <div class="floor-container">
                 <div class="floor-label">2F Map</div>
@@ -288,20 +285,22 @@ def main():
                 const y = obj.oy + r * obj.size;
                 const s = obj.size;
                 if(val==1) { 
-                    // 料架區
                     const key = c + "," + r;
-                    // 如果在 coordinates 中，就是真料架
-                    // 如果是地圖原始的 1 (牆壁) 且不在 coordinate 中，則視為牆
-                    // 但 Step 4 已經把非 valid 的都當牆了
                     if (shelfSets[floorName].has(key)) {
-                        ctx.fillStyle = '#8d6e63';
+                        ctx.fillStyle = '#8d6e63'; // Shelf
                     } else {
-                        ctx.fillStyle = '#ccc'; // 真牆壁
+                        ctx.fillStyle = '#eee'; // Just floor marked as 1
                     }
                     ctx.fillRect(x,y,s,s); 
                 } 
+                else if(val==-1) { ctx.fillStyle = '#ccc'; ctx.fillRect(x,y,s,s); } // Wall
                 else if(val==2) { ctx.strokeStyle='#bbb'; ctx.strokeRect(x,y,s,s); } 
                 else if(val==3) { ctx.fillStyle='#e0f7fa'; ctx.fillRect(x,y,s,s); } 
+                else { 
+                    // 0 or others = White (Aisle)
+                    ctx.fillStyle = 'white'; 
+                    ctx.fillRect(x,y,s,s);
+                }
             }
         }
         Object.keys(stState).forEach(sid => {
