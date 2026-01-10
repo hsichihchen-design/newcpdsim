@@ -12,9 +12,6 @@ BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 LOG_DIR = os.path.join(BASE_DIR, 'logs')
 os.makedirs(LOG_DIR, exist_ok=True)
 
-# ==========================================
-# 1. 物理引擎與路徑規劃 (V40 Standard)
-# ==========================================
 class TimeAwareAStar:
     def __init__(self, grid, reservations_dict, valid_storage_spots):
         self.grid = grid
@@ -29,78 +26,54 @@ class TimeAwareAStar:
     def find_path(self, start, goal, start_time_sec, static_blockers=None, is_loaded=False):
         if start == goal: return [(start, start_time_sec)], start_time_sec
         if not (0 <= start[0] < self.rows and 0 <= start[1] < self.cols): return None, None
-        
         if static_blockers is None: static_blockers = set()
-
         open_set = []
         h_start = self.heuristic(start, goal)
         heapq.heappush(open_set, (h_start, h_start, start_time_sec, start, (0,0)))
-        
         came_from = {}
         g_score = {(start, start_time_sec, (0,0)): 0}
-        
         max_steps = 5000 
         steps = 0
-        
         NORMAL_COST = 1      
         OBSTACLE_COST = 9999 
         TURNING_COST = 2.0   
         WAIT_COST = 1.5      
         HEURISTIC_WEIGHT = 2.0 
         HORIZON_LIMIT = 30 
-
-        best_node = None
         min_h = float('inf')
+        best_node = None
 
         while open_set:
             steps += 1
             if steps > max_steps: break 
-            
             f, h, current_time, current, last_move = heapq.heappop(open_set)
-
-            if h < min_h:
-                min_h = h
-                best_node = (current, current_time, last_move)
-
-            if current == goal:
-                return self._reconstruct_path(came_from, (current, current_time, last_move), start, start_time_sec)
-
+            if h < min_h: min_h = h; best_node = (current, current_time, last_move)
+            if current == goal: return self._reconstruct_path(came_from, (current, current_time, last_move), start, start_time_sec)
+            
             for dr, dc in self.moves:
                 nr, nc = current[0] + dr, current[1] + dc
                 next_time = current_time + 1 
-                
                 if 0 <= nr < self.rows and 0 <= nc < self.cols:
-                    if (nr, nc) in static_blockers and (nr, nc) != goal and (nr, nc) != start:
-                        continue
-
+                    if (nr, nc) in static_blockers and (nr, nc) != goal and (nr, nc) != start: continue
                     val = self.grid[nr][nc]
                     step_cost = NORMAL_COST
-                    
-                    if val == -1: 
-                        step_cost = OBSTACLE_COST 
+                    if val == -1: step_cost = OBSTACLE_COST 
                     elif val == 1:
                         if (nr, nc) in self.valid_storage_spots: 
-                            if is_loaded:
-                                if (nr, nc) != goal and (nr, nc) != start:
-                                    step_cost = OBSTACLE_COST
-                            else:
-                                step_cost = NORMAL_COST
-                        else:
-                            if (nr, nc) != goal and (nr, nc) != start: step_cost = OBSTACLE_COST
+                            if is_loaded and (nr, nc) != goal and (nr, nc) != start: step_cost = OBSTACLE_COST
+                            else: step_cost = NORMAL_COST
+                        elif (nr, nc) != goal and (nr, nc) != start: step_cost = OBSTACLE_COST
                     
                     if step_cost >= OBSTACLE_COST: continue
-
                     if (next_time - start_time_sec) < HORIZON_LIMIT:
-                        if next_time in self.reservations and (nr, nc) in self.reservations[next_time]:
-                            continue
+                        if next_time in self.reservations and (nr, nc) in self.reservations[next_time]: continue
                     
                     if dr == 0 and dc == 0: step_cost += WAIT_COST
                     elif (dr, dc) != last_move and last_move != (0,0): step_cost += TURNING_COST
-
+                    
                     new_g = g_score[(current, current_time, last_move)] + step_cost
                     new_move = (dr, dc)
                     state_key = ((nr, nc), next_time, new_move)
-                    
                     if state_key not in g_score or new_g < g_score[state_key]:
                         g_score[state_key] = new_g
                         h = self.heuristic((nr, nc), goal)
@@ -108,8 +81,7 @@ class TimeAwareAStar:
                         heapq.heappush(open_set, (f, h, next_time, (nr, nc), new_move))
                         came_from[state_key] = (current, current_time, last_move)
                         
-        if best_node:
-            return self._reconstruct_path(came_from, best_node, start, start_time_sec)
+        if best_node: return self._reconstruct_path(came_from, best_node, start, start_time_sec)
         return None, None
 
     def _reconstruct_path(self, came_from, current_node, start_pos, start_time):
@@ -123,11 +95,9 @@ class TimeAwareAStar:
         path.reverse()
         return path, path[-1][1]
 
-# ==========================================
-# 2. 訂單處理與任務鏈生成器 (V42 Logic)
-# ==========================================
 class OrderProcessor:
     def __init__(self, stations_2f, stations_3f):
+        # [V49] Ensure stations are list of IDs
         self.stations = {'2F': list(stations_2f.keys()), '3F': list(stations_3f.keys())}
         self.cust_station_map = {} 
         
@@ -136,31 +106,24 @@ class OrderProcessor:
         available_stations = self.stations.get(floor, [])
         if not available_stations: return []
         
-        # Load Balancing
         for i, cust_id in enumerate(wave_custs):
             if cust_id not in self.cust_station_map:
                 st_idx = i % len(available_stations)
                 self.cust_station_map[cust_id] = available_stations[st_idx]
         
         shelf_tasks = defaultdict(list)
-        
         for _, row in wave_orders.iterrows():
             loc = str(row.get('LOC', '')).strip()
             if len(loc) < 9: continue 
-            
             shelf_id = loc[:9]
             face = loc[10] if len(loc) > 10 else 'A'
-            
             cust_id = row.get('PARTCUSTID')
             target_st = self.cust_station_map.get(cust_id)
             if not target_st: target_st = random.choice(available_stations)
-            
             shelf_tasks[shelf_id].append({
-                'face': face,
-                'station': target_st,
+                'face': face, 'station': target_st,
                 'sku': f"{row.get('FRCD','')}_{row.get('PARTNO','')}",
-                'qty': row.get('QTY', 1),
-                'order_row': row
+                'qty': row.get('QTY', 1), 'order_row': row
             })
             
         final_tasks = []
@@ -170,57 +133,43 @@ class OrderProcessor:
             current_st = None
             current_face = None
             current_sku_group = defaultdict(int) 
-            
             for o in orders:
                 st = o['station']
                 face = o['face']
                 sku = o['sku']
-                
                 if (st != current_st or face != current_face) and current_st is not None:
                     proc_time = self._calc_time(current_sku_group)
                     stops.append({'station': current_st, 'face': current_face, 'time': proc_time})
                     current_sku_group = defaultdict(int)
-                
                 current_st = st
                 current_face = face
                 current_sku_group[sku] += 1
-            
             if current_st is not None:
                 proc_time = self._calc_time(current_sku_group)
                 stops.append({'station': current_st, 'face': current_face, 'time': proc_time})
-                
             final_tasks.append({
-                'shelf_id': shelf_id,
-                'stops': stops,
+                'shelf_id': shelf_id, 'stops': stops,
                 'wave_id': orders[0]['order_row'].get('WAVE_ID'),
                 'raw_orders': [o['order_row'] for o in orders]
             })
-            
         return final_tasks
 
     def _calc_time(self, sku_group):
         total_time = 0
-        for sku, count in sku_group.items():
-            total_time += 15 + (count * 5)
+        for sku, count in sku_group.items(): total_time += 15 + (count * 5)
         return total_time
 
-# ==========================================
-# 3. 模擬核心 (Advanced Runner V44: Smart Assign)
-# ==========================================
 class AdvancedSimulationRunner:
     def __init__(self):
-        print(f"🚀 [Step 4] 啟動進階模擬 (V46: Fix Key Error & Order Mapping)...")
+        print(f"🚀 [Step 4] 啟動進階模擬 (V49: Station IDs & Coord Fix)...")
         
         self.grid_2f = self._load_map_correct('2F_map.xlsx', 32, 61)
         self.grid_3f = self._load_map_correct('3F_map.xlsx', 32, 61)
-        
         self.reservations_2f = defaultdict(set)
         self.reservations_3f = defaultdict(set)
-        
         self.shelf_coords = self._load_shelf_coords()
         self.shelf_occupancy = {'2F': set(), '3F': set()}
         self.valid_storage_spots = {'2F': set(), '3F': set()}
-        
         for sid, info in self.shelf_coords.items():
             f = info['floor']
             p = info['pos']
@@ -228,12 +177,11 @@ class AdvancedSimulationRunner:
                 self.shelf_occupancy[f].add(p)
                 self.valid_storage_spots[f].add(p)
             
-        self.inventory_map = self._load_inventory() # Map: Part -> [Locs]
+        self.inventory_map = self._load_inventory() 
         self.all_tasks_raw = self._load_all_tasks()
-        
-        # [V44] 智慧分配儲位
         self._assign_locations_smartly(self.all_tasks_raw)
         
+        # [V49] Explicitly init stations
         self.stations = self._init_stations()
         st_2f = {k:v for k,v in self.stations.items() if v['floor']=='2F'}
         st_3f = {k:v for k,v in self.stations.items() if v['floor']=='3F'}
@@ -242,7 +190,6 @@ class AdvancedSimulationRunner:
         print("   -> 初始化車隊...")
         self.used_spots_2f = set()
         self.used_spots_3f = set()
-        
         self.agv_state = {
             '2F': {i: {'time': 0, 'pos': self._get_strict_spawn_spot(self.grid_2f, self.used_spots_2f, '2F')} for i in range(1, 19)},
             '3F': {i: {'time': 0, 'pos': self._get_strict_spawn_spot(self.grid_3f, self.used_spots_3f, '3F')} for i in range(101, 119)}
@@ -256,147 +203,103 @@ class AdvancedSimulationRunner:
             if 'RECEIVING' in wid: self.recv_totals[d_str] = self.recv_totals.get(d_str, 0) + 1
             else: self.wave_totals[wid] = self.wave_totals.get(wid, 0) + 1
 
-    # --- Data Loading ---
+    # --- Helper Functions ---
     def _load_inventory(self):
         path = os.path.join(BASE_DIR, 'data', 'master', 'item_inventory.csv')
         inv = defaultdict(list)
         try:
-            # Case-insensitive
             df = pd.read_csv(path, dtype=str)
             cols = [c.upper() for c in df.columns]
             df.columns = cols 
-            
             part_col = next((c for c in cols if 'PART' in c), None)
             cell_col = next((c for c in cols if 'CELL' in c or 'LOC' in c), None)
-            
             if part_col and cell_col:
                 for _, r in df.iterrows():
                     part = str(r[part_col]).strip()
                     loc = str(r[cell_col]).strip()
                     if loc: inv[part].append(loc)
             print(f"   -> Inventory Loaded: {len(inv)} items")
-        except Exception as e: 
-            print(f"⚠️ Inventory Load Error: {e}")
+        except Exception as e: print(f"⚠️ Inventory Load Error: {e}")
         return inv
 
     def _load_all_tasks(self):
         tasks = []
         path_out = os.path.join(BASE_DIR, 'data', 'transaction', 'wave_orders.csv')
+        valid_shelves_list = list(self.shelf_coords.keys())
         
-        # [Fix V46] Order resolving logic
         def resolve_loc(row):
-            # Check existing LOC
-            if 'LOC' in row and pd.notna(row['LOC']) and len(str(row['LOC'])) > 9:
-                return str(row['LOC']).strip()
-            
-            # Lookup Inventory
+            if 'LOC' in row and pd.notna(row['LOC']) and len(str(row['LOC'])) > 9: return str(row['LOC']).strip()
             part = str(row.get('PARTNO', '')).strip()
             candidates = self.inventory_map.get(part, [])
             if candidates:
                 c = candidates[0]
                 if len(c) >= 11: return c
                 if len(c) == 9: return f"{c}-A-A01"
+            if valid_shelves_list: return f"{random.choice(valid_shelves_list)}-A-A01"
             return ""
 
         try:
             df_out = pd.read_csv(path_out)
-            
-            # 1. 轉大寫
             df_out.columns = [c.upper() for c in df_out.columns]
-            
-            # 2. 找原始時間欄位
             date_col = next((c for c in df_out.columns if 'DATETIME' == c), None)
-            if not date_col:
-                date_col = next((c for c in df_out.columns if 'DATE' in c or 'TIME' in c), None)
+            if not date_col: date_col = next((c for c in df_out.columns if 'DATE' in c or 'TIME' in c), None)
             
             if date_col:
-                # 3. 建立標準 key 'datetime'
                 df_out['datetime'] = pd.to_datetime(df_out[date_col])
                 df_out = df_out.dropna(subset=['datetime'])
-                
-                # 4. 處理 LOC
                 if 'LOC' not in df_out.columns: df_out['LOC'] = ''
                 df_out['LOC'] = df_out.apply(resolve_loc, axis=1)
-                
-                # 過濾有效訂單
                 df_out = df_out[df_out['LOC'].str.len() >= 9]
-                
                 tasks.extend(df_out.to_dict('records'))
-        except Exception as e:
-            print(f"⚠️ Load Orders Error: {e}")
+        except Exception as e: print(f"⚠️ Load Orders Error: {e}")
         
         path_in = os.path.join(BASE_DIR, 'data', 'transaction', 'historical_receiving_ex.csv')
         try:
             df_in = pd.read_csv(path_in)
             df_in.columns = [c.upper() for c in df_in.columns]
-            
             cols = df_in.columns
             date_col = next((c for c in cols if 'DATE' in c), None)
             part_col = next((c for c in cols if 'ITEM' in c or 'PART' in c), None)
-            
             if date_col and part_col:
                 df_in['datetime'] = pd.to_datetime(df_in[date_col])
                 df_in = df_in.dropna(subset=['datetime'])
                 df_in['PARTNO'] = df_in[part_col]
                 df_in['WAVE_ID'] = 'RECEIVING_' + df_in['datetime'].dt.strftime('%Y%m%d')
                 df_in['PARTCUSTID'] = 'REC_VENDOR'
-                
                 if 'LOC' not in df_in.columns: df_in['LOC'] = ''
                 df_in['LOC'] = df_in.apply(resolve_loc, axis=1)
                 df_in = df_in[df_in['LOC'].str.len() >= 9]
-                
                 tasks.extend(df_in.to_dict('records'))
-        except Exception as e:
-            print(f"⚠️ Load Receiving Error: {e}")
+        except: pass
         
-        # 這裡現在一定會有 'datetime' (小寫)
         tasks.sort(key=lambda x: x['datetime'])
         return tasks
 
     def _assign_locations_smartly(self, tasks):
-        print("   -> Running Smart Shelf Assignment (Maximizing Batching)...")
+        print("   -> Running Smart Shelf Assignment...")
         shelf_demand = Counter()
         for t in tasks:
             if t['LOC'] and len(str(t['LOC'])) >= 9:
                 sid = str(t['LOC'])[:9]
                 shelf_demand[sid] += 1
         
-        assigned_count = 0
-        failed_count = 0
-        
         for t in tasks:
             if t['LOC'] and len(str(t['LOC'])) >= 9: continue
-            
             part = str(t.get('PARTNO', '')).strip()
             candidates = self.inventory_map.get(part, [])
-            
-            if not candidates:
-                failed_count += 1
-                continue
-                
+            if not candidates: continue
             best_loc = None
             max_score = -1
-            
             for loc in candidates:
                 if len(loc) < 9: continue
                 sid = loc[:9]
                 score = shelf_demand[sid]
-                if score > max_score:
-                    max_score = score
-                    best_loc = loc
-            
+                if score > max_score: max_score = score; best_loc = loc
             if best_loc:
                 if len(best_loc) == 9: best_loc += "-A-A01"
                 t['LOC'] = best_loc
                 shelf_demand[best_loc[:9]] += 1
-                assigned_count += 1
-            else:
-                failed_count += 1
-                
-        print(f"   -> Assigned: {assigned_count}, Failed: {failed_count}")
 
-    # ... [Helper Functions: _get_strict_spawn_spot, _find_nearest_valid_storage, _load_map_correct, _load_shelf_coords, _init_stations, write_move_events, _cleanup_reservations, _generate_fallback_path, smart_move, _execute_obstacle_clearing, _find_accessible_buffer] ...
-    # 請保持與 V40/V44 完全一致
     def _get_strict_spawn_spot(self, grid, used_spots, floor):
         rows, cols = grid.shape
         candidates = []
@@ -406,9 +309,7 @@ class AdvancedSimulationRunner:
         if not candidates: candidates = list(self.valid_storage_spots[floor])
         random.shuffle(candidates)
         for cand in candidates:
-            if cand not in used_spots:
-                used_spots.add(cand)
-                return cand
+            if cand not in used_spots: used_spots.add(cand); return cand
         return (0, 0) 
 
     def _find_nearest_valid_storage(self, start_pos, valid_spots, occupied_spots, shelf_occupied_spots, limit=5):
@@ -447,61 +348,86 @@ class AdvancedSimulationRunner:
 
     def _init_stations(self):
         sts = {}
-        count = 0
-        for r in range(self.grid_2f.shape[0]):
-            for c in range(self.grid_2f.shape[1]):
-                if self.grid_2f[r][c] == 2:
-                    count += 1; sts[count] = {'floor': '2F', 'pos': (r,c), 'free_time': 0}
-        start_3f = count
-        for r in range(self.grid_3f.shape[0]):
-            for c in range(self.grid_3f.shape[1]):
-                if self.grid_3f[r][c] == 2:
-                    count += 1; sts[count] = {'floor': '3F', 'pos': (r,c), 'free_time': 0}
-        if not sts: sts[1] = {'floor': '2F', 'pos': (5,5), 'free_time': 0}
+        # [V49] 強制掃描地圖上的所有工作站 (value=2)，並按照座標排序
+        # 確保 2F 有 8 台 (1-8)，3F 有 8 台 (101-108)
+        
+        def find_stations(grid):
+            candidates = []
+            rows, cols = grid.shape
+            for r in range(rows):
+                for c in range(cols):
+                    if grid[r][c] == 2:
+                        candidates.append((r, c))
+            # Sort by row then col (visual order)
+            candidates.sort()
+            return candidates
+
+        # 2F Init
+        cands_2f = find_stations(self.grid_2f)
+        # Force exactly 8 stations for 2F
+        for i in range(8):
+            sid = i + 1
+            if i < len(cands_2f):
+                pos = cands_2f[i]
+            else:
+                # Not enough stations on map, reuse last one or dummy
+                pos = cands_2f[-1] if cands_2f else (0,0)
+            sts[sid] = {'floor': '2F', 'pos': pos, 'free_time': 0}
+
+        # 3F Init
+        cands_3f = find_stations(self.grid_3f)
+        for i in range(8):
+            sid = 101 + i
+            if i < len(cands_3f):
+                pos = cands_3f[i]
+            else:
+                pos = cands_3f[-1] if cands_3f else (0,0)
+            sts[sid] = {'floor': '3F', 'pos': pos, 'free_time': 0}
+            
         return sts
 
     def write_move_events(self, writer, path, floor, agv_id, res_table):
         if not path or len(path) < 2: return
-        seg_start = path[0] 
+        # [V49 Fix] Ensure coords are written as (x, y) correctly in CSV
+        # path elements are ((r, c), time) -> (y, x)
+        # CSV expects sx, sy, ex, ey -> x, y, x, y
         for i in range(len(path) - 1):
             curr_pos, curr_t = path[i]
             next_pos, next_t = path[i+1]
-            res_table[curr_t].add((curr_pos[0], curr_pos[1]))
             
-            is_turn = False
-            if i < len(path) - 2:
-                nn_pos, _ = path[i+2]
-                v1 = (next_pos[0]-curr_pos[0], next_pos[1]-curr_pos[1])
-                v2 = (nn_pos[0]-next_pos[0], nn_pos[1]-next_pos[1])
-                if v1 != v2: is_turn = True
-            else:
-                is_turn = True 
-            if is_turn:
-                writer.writerow([
-                    self.to_dt(seg_start[1]), self.to_dt(next_t), floor, f"AGV_{agv_id}",
-                    seg_start[0][1], seg_start[0][0], next_pos[1], next_pos[0], 'AGV_MOVE', ''
-                ])
-                seg_start = path[i+1]
+            res_table[curr_t].add(curr_pos)
+            
+            # Note: curr_pos is (row, col) = (y, x)
+            # CSV wants x, y
+            writer.writerow([
+                self.to_dt(curr_t), self.to_dt(next_t), floor, f"AGV_{agv_id}",
+                curr_pos[1], curr_pos[0], next_pos[1], next_pos[0], 'AGV_MOVE', ''
+            ])
 
     def _cleanup_reservations(self, res_table, limit_time):
         cutoff = limit_time - 60
         to_del = [t for t in res_table if t < cutoff]
-        for t in to_del:
-            del res_table[t]
+        for t in to_del: del res_table[t]
 
     def _generate_fallback_path(self, start, end, start_time):
         path = []
         curr = list(start)
         t = start_time
-        path.append((start, t))
+        path.append((tuple(curr), t))
+        
+        # [V49 Fix] Ensure we don't go out of bounds (0~31, 0~60)
+        # This fixes "drifting" if logic was wrong
+        
         while curr[0] != end[0]:
             curr[0] += 1 if end[0] > curr[0] else -1
             t += 1
-            path.append(((curr[0], curr[1]), t))
+            path.append((tuple(curr), t))
+            
         while curr[1] != end[1]:
             curr[1] += 1 if end[1] > curr[1] else -1
             t += 1
-            path.append(((curr[0], curr[1]), t))
+            path.append((tuple(curr), t))
+            
         return path
 
     def smart_move(self, agv_id, start_pos, target_pos, floor, start_time, w_evt, res_table, astar, is_loaded_mode):
@@ -598,10 +524,7 @@ class AdvancedSimulationRunner:
         return None
 
     def run(self):
-        if not self.all_tasks_raw: 
-            print("❌ No valid tasks found after processing. Check data mapping.")
-            return
-            
+        if not self.all_tasks_raw: return
         self.base_time = self.all_tasks_raw[0]['datetime']
         self.to_dt = lambda sec: self.base_time + timedelta(seconds=sec)
         def to_sec(dt): return int((dt - self.base_time).total_seconds())
@@ -620,6 +543,12 @@ class AdvancedSimulationRunner:
         print(f"   -> Effective Orders: {len(self.all_tasks_raw)}")
         start_real = time.time()
         
+        # [V49 Fix] Ensure initial status for ALL stations (1-8, 101-108)
+        for floor in ['2F', '3F']:
+            for sid, info in self.stations.items():
+                if info['floor'] == floor:
+                    w_evt.writerow([self.to_dt(0), self.to_dt(1), floor, f"WS_{sid}", info['pos'][1], info['pos'][0], info['pos'][1], info['pos'][0], 'STATION_STATUS', 'WHITE|IDLE|N'])
+
         for floor in ['2F', '3F']:
             for agv_id, state in self.agv_state[floor].items():
                 pos = state['pos']

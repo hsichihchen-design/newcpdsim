@@ -40,7 +40,7 @@ def load_shelf_map():
     return shelf_set
 
 def main():
-    print("🚀 [Step 5] 啟動視覺化 (V32: KPI Robust Reader)...")
+    print("🚀 [Step 5] 啟動視覺化 (V34: Fix Syntax Error)...")
 
     map_2f = load_map_fixed('2F_map.xlsx', 32, 61)
     map_3f = load_map_fixed('3F_map.xlsx', 32, 61)
@@ -81,7 +81,11 @@ def main():
     events_data = df_events[['start_ts', 'end_ts', 'floor', 'obj_id', 'sx', 'sy', 'ex', 'ey', 'type', 'text']].values.tolist()
     
     all_agvs = df_events[df_events['type']=='AGV_MOVE']['obj_id'].unique().tolist()
+    
+    # [V33 Fix] Robustly find all stations, even those initialized but idle
     all_stations = df_events[df_events['obj_id'].str.startswith('WS_')]['obj_id'].unique().tolist()
+    
+    # Sort stations numerically
     try: all_stations.sort(key=lambda x: int(x.split('_')[1]))
     except: pass
 
@@ -98,7 +102,6 @@ def main():
         except:
             df_kpi = pd.read_csv(kpi_path, error_bad_lines=False, engine='python')
 
-        # [Fix] 增強日期讀取，處理可能的格式問題
         df_kpi['finish_ts'] = pd.to_datetime(df_kpi['finish_time'], errors='coerce')
         df_kpi = df_kpi.dropna(subset=['finish_ts'])
         df_kpi['date'] = df_kpi['finish_ts'].dt.strftime('%Y-%m-%d')
@@ -128,7 +131,7 @@ def main():
 <html>
 <head>
     <meta charset="utf-8">
-    <title>Warehouse Monitor V32</title>
+    <title>Warehouse Monitor V34</title>
     <style>
         body { font-family: 'Segoe UI', sans-serif; margin: 0; display: flex; flex-direction: column; height: 100vh; overflow: hidden; background: #eef1f5; }
         .header { background: #fff; height: 40px; padding: 0 20px; display: flex; align-items: center; border-bottom: 1px solid #ddd; flex-shrink: 0; }
@@ -161,7 +164,7 @@ def main():
 </head>
 <body>
     <div class="header">
-        <h3>🏭 倉儲戰情室 (V32)</h3>
+        <h3>🏭 倉儲戰情室 (V34)</h3>
         <div style="flex:1"></div>
         <span id="timeDisplay" style="font-weight: bold;">--</span>
     </div>
@@ -258,7 +261,6 @@ def main():
         stState[id] = { status: 'IDLE', color: 'WHITE', floor: f, x:-1, y:-1, wave:'-', delay: false }; 
     });
 
-    // Dynamic Shelf State
     let currentShelves = { '2F': new Set(), '3F': new Set() };
 
     function setupCanvas(id, mapData) {
@@ -293,11 +295,10 @@ def main():
                 const s = obj.size;
                 if(val==1) { 
                     const key = c + "," + r;
-                    // Check dynamic state
                     if (currentShelves[floorName].has(key)) {
-                        ctx.fillStyle = '#8d6e63'; // Brown Shelf
+                        ctx.fillStyle = '#8d6e63'; 
                     } else {
-                        ctx.fillStyle = '#eee'; // Empty Floor
+                        ctx.fillStyle = '#eee'; 
                     }
                     ctx.fillRect(x,y,s,s); 
                 } 
@@ -307,7 +308,7 @@ def main():
                 else { ctx.fillStyle = 'white'; ctx.fillRect(x,y,s,s); }
             }
         }
-        // Draw Stations
+        
         Object.keys(stState).forEach(sid => {
             const s = stState[sid];
             if(s.floor === floorName && s.x !== -1) {
@@ -331,16 +332,13 @@ def main():
     slider.value = minTime;
 
     function updateState(time) {
-        // Reset shelves to initial state
         currentShelves['2F'] = new Set(initialShelfSets['2F']);
         currentShelves['3F'] = new Set(initialShelfSets['3F']);
         
-        // Replay shelf events up to current time to determine state
         for(let i=0; i<events.length; i++) {
             const e = events[i];
-            if (e[0] > time) break; // Future event
+            if (e[0] > time) break; 
             
-            // e[8] is type, e[2] is floor, e[4],e[5] is sx,sy
             if (e[8] === 'SHELF_LOAD') {
                 const key = e[4] + "," + e[5];
                 currentShelves[e[2]].delete(key);
@@ -352,7 +350,6 @@ def main():
 
         agvIds.forEach(id => {
             let activeEvt = null, lastEvt = null;
-            // Track loaded state by checking last LOAD/UNLOAD event for this AGV
             let isLoaded = false;
             
             for(let i=0; i<events.length; i++) {
@@ -385,7 +382,6 @@ def main():
             }
         });
         
-        // ... (Station update same as before) ...
         Object.keys(stState).forEach(sid => { stState[sid].status = 'IDLE'; stState[sid].color = 'WHITE'; stState[sid].wave = '-'; stState[sid].delay = false; });
         for(let i=0; i<events.length; i++) {
             const e = events[i];
@@ -433,11 +429,9 @@ def main():
             
             obj.ctx.beginPath();
             if (s.loaded) {
-                // Draw Square
                 const half = sz/2.5;
                 obj.ctx.fillRect(px-half, py-half, half*2, half*2);
             } else {
-                // Draw Circle
                 obj.ctx.arc(px, py, sz/2.2, 0, Math.PI*2);
                 obj.ctx.fill();
             }
@@ -521,13 +515,15 @@ def main():
         
         let rHtml = '';
         const todayStr = getLocalYMD(currTime);
-        if (recvInfoLive[todayStr]) {
-            const info = recvInfoLive[todayStr];
-            const done = doneRecv[todayStr] || 0;
-            const pct = info.total > 0 ? (done/info.total*100).toFixed(0) : 0;
-            rHtml = `<div class="wave-item"><div style="display:flex;justify-content:space-between"><span>📅 ${todayStr}</span><span>${done}/${info.total}</span></div><div class="progress-bg"><div class="progress-fill" style="width:${pct}%;background:#28a745"></div></div></div>`;
+        const recvKeys = Object.keys(recvInfoLive).sort();
+        if (recvKeys.length > 0) {
+             const showDate = recvInfoLive[todayStr] ? todayStr : recvKeys[0];
+             const info = recvInfoLive[showDate];
+             const done = doneRecv[showDate] || 0;
+             const pct = info.total > 0 ? (done/info.total*100).toFixed(0) : 0;
+             rHtml = `<div class="wave-item"><div style="display:flex;justify-content:space-between"><span>📅 ${showDate}</span><span>${done}/${info.total}</span></div><div class="progress-bg"><div class="progress-fill" style="width:${pct}%;background:#28a745"></div></div></div>`;
         } else {
-            rHtml = `<div style="color:#999;padding:5px">No receiving orders on ${todayStr}</div>`;
+            rHtml = `<div style="color:#999;padding:5px">No receiving data</div>`;
         }
         document.getElementById('recv-list').innerHTML = rHtml;
     }
