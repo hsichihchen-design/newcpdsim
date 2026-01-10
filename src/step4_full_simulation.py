@@ -146,11 +146,9 @@ class OrderProcessor:
         
         for _, row in wave_orders.iterrows():
             loc = str(row.get('LOC', '')).strip()
-            # LOC should be assigned by now
             if len(loc) < 9: continue 
             
             shelf_id = loc[:9]
-            # 如果沒有面位資料，預設 A
             face = loc[10] if len(loc) > 10 else 'A'
             
             cust_id = row.get('PARTCUSTID')
@@ -211,7 +209,7 @@ class OrderProcessor:
 # ==========================================
 class AdvancedSimulationRunner:
     def __init__(self):
-        print(f"🚀 [Step 4] 啟動進階模擬 (V45: Case-Insensitive Inventory Fix)...")
+        print(f"🚀 [Step 4] 啟動進階模擬 (V46: Fix Key Error & Order Mapping)...")
         
         self.grid_2f = self._load_map_correct('2F_map.xlsx', 32, 61)
         self.grid_3f = self._load_map_correct('3F_map.xlsx', 32, 61)
@@ -258,15 +256,15 @@ class AdvancedSimulationRunner:
             if 'RECEIVING' in wid: self.recv_totals[d_str] = self.recv_totals.get(d_str, 0) + 1
             else: self.wave_totals[wid] = self.wave_totals.get(wid, 0) + 1
 
-    # --- Data Loading & Smart Assignment ---
+    # --- Data Loading ---
     def _load_inventory(self):
         path = os.path.join(BASE_DIR, 'data', 'master', 'item_inventory.csv')
         inv = defaultdict(list)
         try:
-            # [V45 Fix] Case-insensitive column search
+            # Case-insensitive
             df = pd.read_csv(path, dtype=str)
             cols = [c.upper() for c in df.columns]
-            df.columns = cols # 強制轉大寫
+            df.columns = cols 
             
             part_col = next((c for c in cols if 'PART' in c), None)
             cell_col = next((c for c in cols if 'CELL' in c or 'LOC' in c), None)
@@ -284,46 +282,80 @@ class AdvancedSimulationRunner:
     def _load_all_tasks(self):
         tasks = []
         path_out = os.path.join(BASE_DIR, 'data', 'transaction', 'wave_orders.csv')
+        
+        # [Fix V46] Order resolving logic
+        def resolve_loc(row):
+            # Check existing LOC
+            if 'LOC' in row and pd.notna(row['LOC']) and len(str(row['LOC'])) > 9:
+                return str(row['LOC']).strip()
+            
+            # Lookup Inventory
+            part = str(row.get('PARTNO', '')).strip()
+            candidates = self.inventory_map.get(part, [])
+            if candidates:
+                c = candidates[0]
+                if len(c) >= 11: return c
+                if len(c) == 9: return f"{c}-A-A01"
+            return ""
+
         try:
             df_out = pd.read_csv(path_out)
-            df_out['datetime'] = pd.to_datetime(df_out['datetime'])
-            df_out = df_out.dropna(subset=['datetime'])
             
-            # 確保欄位名大寫，避免大小寫問題
+            # 1. 轉大寫
             df_out.columns = [c.upper() for c in df_out.columns]
             
-            if 'LOC' not in df_out.columns: df_out['LOC'] = ''
-            tasks.extend(df_out.to_dict('records'))
-        except: pass
+            # 2. 找原始時間欄位
+            date_col = next((c for c in df_out.columns if 'DATETIME' == c), None)
+            if not date_col:
+                date_col = next((c for c in df_out.columns if 'DATE' in c or 'TIME' in c), None)
+            
+            if date_col:
+                # 3. 建立標準 key 'datetime'
+                df_out['datetime'] = pd.to_datetime(df_out[date_col])
+                df_out = df_out.dropna(subset=['datetime'])
+                
+                # 4. 處理 LOC
+                if 'LOC' not in df_out.columns: df_out['LOC'] = ''
+                df_out['LOC'] = df_out.apply(resolve_loc, axis=1)
+                
+                # 過濾有效訂單
+                df_out = df_out[df_out['LOC'].str.len() >= 9]
+                
+                tasks.extend(df_out.to_dict('records'))
+        except Exception as e:
+            print(f"⚠️ Load Orders Error: {e}")
         
         path_in = os.path.join(BASE_DIR, 'data', 'transaction', 'historical_receiving_ex.csv')
         try:
             df_in = pd.read_csv(path_in)
-            # 強制大寫
             df_in.columns = [c.upper() for c in df_in.columns]
             
             cols = df_in.columns
             date_col = next((c for c in cols if 'DATE' in c), None)
             part_col = next((c for c in cols if 'ITEM' in c or 'PART' in c), None)
+            
             if date_col and part_col:
                 df_in['datetime'] = pd.to_datetime(df_in[date_col])
                 df_in = df_in.dropna(subset=['datetime'])
                 df_in['PARTNO'] = df_in[part_col]
                 df_in['WAVE_ID'] = 'RECEIVING_' + df_in['datetime'].dt.strftime('%Y%m%d')
                 df_in['PARTCUSTID'] = 'REC_VENDOR'
+                
                 if 'LOC' not in df_in.columns: df_in['LOC'] = ''
+                df_in['LOC'] = df_in.apply(resolve_loc, axis=1)
+                df_in = df_in[df_in['LOC'].str.len() >= 9]
+                
                 tasks.extend(df_in.to_dict('records'))
-        except: pass
+        except Exception as e:
+            print(f"⚠️ Load Receiving Error: {e}")
         
+        # 這裡現在一定會有 'datetime' (小寫)
         tasks.sort(key=lambda x: x['datetime'])
         return tasks
 
     def _assign_locations_smartly(self, tasks):
         print("   -> Running Smart Shelf Assignment (Maximizing Batching)...")
-        # 1. 統計目前已知的料架需求熱度 (Shelf Demand Heatmap)
         shelf_demand = Counter()
-        
-        # 預先掃描有 LOC 的任務
         for t in tasks:
             if t['LOC'] and len(str(t['LOC'])) >= 9:
                 sid = str(t['LOC'])[:9]
@@ -332,9 +364,7 @@ class AdvancedSimulationRunner:
         assigned_count = 0
         failed_count = 0
         
-        # 2. 分配
         for t in tasks:
-            # Skip if already has valid LOC
             if t['LOC'] and len(str(t['LOC'])) >= 9: continue
             
             part = str(t.get('PARTNO', '')).strip()
@@ -344,8 +374,6 @@ class AdvancedSimulationRunner:
                 failed_count += 1
                 continue
                 
-            # 智慧選擇：優先選擇「目前需求最高」的料架
-            # 這樣可以讓同一個料架一次處理更多 SKU
             best_loc = None
             max_score = -1
             
@@ -353,26 +381,22 @@ class AdvancedSimulationRunner:
                 if len(loc) < 9: continue
                 sid = loc[:9]
                 score = shelf_demand[sid]
-                
                 if score > max_score:
                     max_score = score
                     best_loc = loc
             
-            # 如果都沒人選過 (score=0)，就選第一個
             if best_loc:
-                # 確保格式正確 (補面位)
                 if len(best_loc) == 9: best_loc += "-A-A01"
-                
                 t['LOC'] = best_loc
                 shelf_demand[best_loc[:9]] += 1
                 assigned_count += 1
             else:
                 failed_count += 1
                 
-        print(f"   -> Assigned: {assigned_count}, Failed: {failed_count} (Check Inventory Map)")
+        print(f"   -> Assigned: {assigned_count}, Failed: {failed_count}")
 
-    # ... [Keep previous Helper Functions: _get_strict_spawn_spot, _find_nearest_valid_storage, _load_map_correct, _load_shelf_coords, _init_stations, write_move_events, _cleanup_reservations, _generate_fallback_path, smart_move, _execute_obstacle_clearing, _find_accessible_buffer] ...
-    # 請保持 V40 的物理引擎邏輯不變
+    # ... [Helper Functions: _get_strict_spawn_spot, _find_nearest_valid_storage, _load_map_correct, _load_shelf_coords, _init_stations, write_move_events, _cleanup_reservations, _generate_fallback_path, smart_move, _execute_obstacle_clearing, _find_accessible_buffer] ...
+    # 請保持與 V40/V44 完全一致
     def _get_strict_spawn_spot(self, grid, used_spots, floor):
         rows, cols = grid.shape
         candidates = []
@@ -643,28 +667,23 @@ class AdvancedSimulationRunner:
                     
                 shelf_pos = self.shelf_coords[shelf_id]['pos']
                 
-                # Task Start
                 current_t = agv_ready_time
                 agv_pos = agv_pool[best_agv]['pos']
                 
-                # Step A: Move to Shelf
                 current_t = self.smart_move(best_agv, agv_pos, shelf_pos, floor, current_t, w_evt, res_table, astar, is_loaded_mode=False)
                 
-                # Load Shelf
                 w_evt.writerow([self.to_dt(current_t), self.to_dt(current_t+5), floor, f"AGV_{best_agv}", shelf_pos[1], shelf_pos[0], shelf_pos[1], shelf_pos[0], 'SHELF_LOAD', f"Task_{done_count}"])
                 current_t += 5
                 if shelf_pos in self.shelf_occupancy[floor]: self.shelf_occupancy[floor].remove(shelf_pos)
                 
                 current_shelf_pos = shelf_pos
                 
-                # Step B: Stops
                 for stop in task['stops']:
                     target_st = stop['station']
                     st_pos = self.stations[target_st]['pos']
                     proc_time = stop['time']
                     
                     if current_shelf_pos == st_pos:
-                        # Face Change (Micro Move)
                         buffer_pos = self._find_accessible_buffer(st_pos, self.grid_2f if floor=='2F' else self.grid_3f, self.shelf_occupancy[floor], astar, current_t)
                         if not buffer_pos: buffer_pos = (st_pos[0]+1, st_pos[1])
                         
@@ -675,7 +694,6 @@ class AdvancedSimulationRunner:
                     
                     current_shelf_pos = st_pos
                     
-                    # Process
                     leave_t = current_t + proc_time
                     w_evt.writerow([self.to_dt(current_t), self.to_dt(leave_t), floor, f"WS_{target_st}", st_pos[1], st_pos[0], st_pos[1], st_pos[0], 'STATION_STATUS', 'BLUE|BUSY|N'])
                     w_evt.writerow([self.to_dt(current_t), self.to_dt(leave_t), floor, f"AGV_{best_agv}", st_pos[1], st_pos[0], st_pos[1], st_pos[0], 'PICKING', f"Processing"])
@@ -683,7 +701,6 @@ class AdvancedSimulationRunner:
                     for t in range(current_t, int(leave_t)): res_table[t].add(st_pos)
                     current_t = int(leave_t)
                 
-                # Step C: Return
                 candidates = self._find_nearest_valid_storage(current_shelf_pos, self.valid_storage_spots[floor], {s['pos'] for k,s in agv_pool.items()}, self.shelf_occupancy[floor])
                 if not candidates: candidates = [shelf_pos]
                 drop_pos = candidates[0]
