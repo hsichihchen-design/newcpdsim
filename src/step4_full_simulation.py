@@ -72,7 +72,7 @@ class TimeAwareAStar:
         NORMAL_COST = 1      
         TURNING_COST = 1.0   
         WAIT_COST = 1.0       
-        TUNNEL_COST = 50.0  # 穿牆的高昂代價
+        TUNNEL_COST = 50.0 
 
         while open_set:
             steps += 1
@@ -81,7 +81,6 @@ class TimeAwareAStar:
             f, h, current_time, current, last_move = heapq.heappop(open_set)
 
             if current == goal:
-                # 這裡會呼叫 _reconstruct_path
                 return self._reconstruct_path(came_from, (current, current_time, last_move), start, start_time_sec)
 
             for dr, dc in self.moves:
@@ -93,7 +92,7 @@ class TimeAwareAStar:
                     
                     step_cost = NORMAL_COST
 
-                    # --- 動態障礙檢查 (Dynamic Reservations) ---
+                    # --- 動態障礙檢查 ---
                     if not ignore_dynamic:
                         if (next_time - start_time_sec) < 60: 
                             if next_time in self.reservations:
@@ -103,25 +102,21 @@ class TimeAwareAStar:
                                        (current in self.reservations[next_time]):
                                         continue
 
-                    # --- 靜態料架檢查 (Shelf Occupancy) ---
+                    # --- 靜態料架檢查 ---
                     is_spot_occupied = ((nr, nc) in self.shelf_occupancy)
                     
                     if is_loaded:
-                        # [載貨邏輯]
+                        # 載貨邏輯
                         if is_spot_occupied:
-                            # 1. 如果是起點或終點，允許
                             if (nr, nc) == goal or (nr, nc) == start:
                                 pass 
-                            # 2. 如果開啟了 allow_tunneling (救命模式)，允許穿牆但代價極高
                             elif allow_tunneling:
                                 step_cost += TUNNEL_COST
-                            # 3. 否則嚴禁碰撞
                             else:
                                 continue 
                     else:
-                        # [空車邏輯]
+                        # 空車邏輯 (允許鑽料架)
                         if is_spot_occupied:
-                            # 允許鑽入料架下方，稍微增加一點成本 (模擬減速小心駕駛)
                             step_cost += 0.5
 
                     if dr == 0 and dc == 0: step_cost += WAIT_COST
@@ -140,7 +135,6 @@ class TimeAwareAStar:
                         
         return None, None
 
-    # [補回] 這個函式之前漏掉了
     def _reconstruct_path(self, came_from, current_node, start_pos, start_time):
         path = []
         curr = current_node
@@ -382,13 +376,41 @@ class ParkingManager:
         occupied_by_agvs = {s['pos'] for s in agv_pool.values()}
         while attempts < 20:
             spot = random.choice(self.valid_spots_list)
-            
             # [修正] 只要沒有「其他 AGV」，就可以停！
-            # 不再檢查 spot not in self.shelf_occupancy
             if spot not in occupied_by_agvs:
                 return spot
             attempts += 1
         return None
+
+# [V66 Feature] Zone Manager 區域總量管制
+class ZoneManager:
+    def __init__(self, stations_info, capacity=6):
+        self.zones = {} # {sid: current_count}
+        self.capacity = capacity
+        for sid in stations_info:
+            self.zones[sid] = 0
+            
+    def can_enter(self, sid):
+        if sid not in self.zones: return False
+        return self.zones[sid] < self.capacity
+        
+    def enter(self, sid):
+        if sid in self.zones:
+            self.zones[sid] += 1
+            return True
+        return False
+        
+    def exit(self, sid):
+        if sid in self.zones and self.zones[sid] > 0:
+            self.zones[sid] -= 1
+            
+    def get_usage(self, sid):
+        return self.zones.get(sid, 0)
+        
+    def force_reset(self, sid):
+        if sid in self.zones:
+            print(f"🧹 [Zone Reset] 重置區域計數 {sid} (原: {self.zones[sid]})")
+            self.zones[sid] = 0
 
 class PhysicalQueueManager:
     def __init__(self, stations_info):
@@ -405,7 +427,8 @@ class PhysicalQueueManager:
                 'slots': q_slots,
                 'exits': exits,
                 'occupants': [None] * len(q_slots),
-                'processing': None 
+                'processing': None,
+                'processing_since': None 
             }
 
     def get_target_for_agv(self, sid, agv_id):
@@ -445,7 +468,10 @@ class PhysicalQueueManager:
         
         proc_pos = (q_data['slots'][0][0], 1)
         if current_pos == proc_pos:
-            q_data['processing'] = agv_id
+            if q_data['processing'] != agv_id:
+                q_data['processing'] = agv_id
+                q_data['processing_since'] = 0 
+                
             if agv_id in q_data['occupants']:
                 idx = q_data['occupants'].index(agv_id)
                 q_data['occupants'][idx] = None
@@ -458,30 +484,63 @@ class PhysicalQueueManager:
                 if old_idx != idx: q_data['occupants'][old_idx] = None
             q_data['occupants'][idx] = agv_id
 
+    def set_processing_time(self, sid, current_time):
+        q_data = self.station_queues.get(sid)
+        if q_data and q_data['processing'] is not None:
+            if q_data['processing_since'] == 0: 
+                q_data['processing_since'] = current_time
+
     def release_station(self, sid, agv_id):
         q_data = self.station_queues.get(sid)
         if q_data and q_data['processing'] == agv_id:
             q_data['processing'] = None
+            q_data['processing_since'] = None
             
     def get_exit_spot(self, sid):
         q_data = self.station_queues.get(sid)
-        if q_data:
-            return q_data['exits'][0] 
+        if q_data: return q_data['exits'][0] 
         return None
+        
+    def is_station_jammed(self, sid, current_time, threshold=300):
+        q_data = self.station_queues.get(sid)
+        if not q_data: return False
+        
+        if q_data['processing'] is not None and q_data['processing_since'] is not None:
+            if q_data['processing_since'] > 0: 
+                elapsed = current_time - q_data['processing_since']
+                if elapsed > threshold:
+                    return True
+        return False
+
+    def get_debug_state(self, sid):
+        q = self.station_queues.get(sid)
+        if not q: return "Unknown Station"
+        return f"Processing: {q['processing']} | Slots: {q['occupants']}"
+        
+    def force_reset_station(self, sid):
+        q_data = self.station_queues.get(sid)
+        if q_data:
+            q_data['occupants'] = [None] * len(q_data['slots'])
+            # 注意：不清除 processing，因為可能真的有車
+            print(f"🧹 [Ghost Buster] 已強制驅魔工作站 {sid} 的排隊區")
 
 class OrderProcessor:
     def __init__(self, stations_2f, stations_3f):
         self.stations = {'2F': list(stations_2f.keys()), '3F': list(stations_3f.keys())}
-        self.cust_station_map = {} 
+        self.cust_station_map = {'2F': {}, '3F': {}} 
 
     def process_wave(self, wave_orders, floor):
         wave_custs = wave_orders['PARTCUSTID'].unique()
         available_stations = self.stations.get(floor, [])
         if not available_stations: return []
+        
+        floor_map = self.cust_station_map[floor]
+
         for i, cust_id in enumerate(wave_custs):
-            if cust_id not in self.cust_station_map:
+            if cust_id not in floor_map:
                 st_idx = i % len(available_stations)
-                self.cust_station_map[cust_id] = available_stations[st_idx]
+                floor_map[cust_id] = available_stations[st_idx]
+                
         shelf_tasks = defaultdict(list)
         for _, row in wave_orders.iterrows():
             loc = str(row.get('LOC', '')).strip()
@@ -489,14 +548,17 @@ class OrderProcessor:
             shelf_id = loc[:9]
             face = loc[10] if len(loc) > 10 else 'A'
             cust_id = row.get('PARTCUSTID')
-            target_st = self.cust_station_map.get(cust_id)
+            
+            target_st = floor_map.get(cust_id)
             if not target_st: target_st = random.choice(available_stations)
+            
             shelf_tasks[shelf_id].append({
                 'face': face, 'station': target_st,
                 'sku': f"{row.get('FRCD','')}_{row.get('PARTNO','')}",
                 'qty': row.get('QTY', 1), 'order_row': row,
-                'datetime': row.get('datetime', None) # Pass datetime to task
+                'datetime': row.get('datetime', None) 
             })
+            
         final_tasks = []
         for shelf_id, orders in shelf_tasks.items():
             orders.sort(key=lambda x: (x['station'], x['face']))
@@ -504,7 +566,6 @@ class OrderProcessor:
             current_st = None
             current_face = None
             current_sku_group = defaultdict(int) 
-            # Use the earliest order time as the task time
             task_dt = orders[0]['datetime'] 
             
             for o in orders:
@@ -527,7 +588,7 @@ class OrderProcessor:
                 'shelf_id': shelf_id, 'stops': stops,
                 'wave_id': orders[0]['order_row'].get('WAVE_ID'),
                 'raw_orders': [o['order_row'] for o in orders],
-                'datetime': task_dt # Add datetime to the consolidated task
+                'datetime': task_dt
             })
         return final_tasks
 
@@ -560,7 +621,7 @@ class LiveMonitor:
 
 class AdvancedSimulationRunner:
     def __init__(self):
-        print(f"🚀 [Step 4] 啟動進階模擬 (V65: Historical Time Lock)...")
+        print(f"🚀 [Step 4] 啟動進階模擬 (V66: Zone Control & Traffic Monitor)...")
         
         self.grid_2f = self._load_map_correct('2F_map.xlsx', 32, 61)
         self.grid_3f = self._load_map_correct('3F_map.xlsx', 32, 61)
@@ -624,6 +685,10 @@ class AdvancedSimulationRunner:
         
         self.qm_2f = PhysicalQueueManager(st_2f)
         self.qm_3f = PhysicalQueueManager(st_3f)
+        
+        # [V66] 區域管制 (Zone Manager)
+        self.zm_2f = ZoneManager(st_2f, capacity=6)
+        self.zm_3f = ZoneManager(st_3f, capacity=6)
         
         self.wave_totals = {}
         self.recv_totals = {}
@@ -944,7 +1009,7 @@ class AdvancedSimulationRunner:
                 
             total_tasks = len(task_queue_2f) + len(task_queue_3f)
             
-            print(f"🎬 開始模擬... (V65: Time Lock + Congestion Relief)...")
+            print(f"🎬 開始模擬... (V66: Zone Control & Traffic Monitor)...")
             print(f"   -> 原始訂單: {len(self.all_tasks_raw)} | AGV任務: {total_tasks}")
             
             for floor in ['2F', '3F']:
@@ -963,9 +1028,11 @@ class AdvancedSimulationRunner:
             astars = {'2F': astar_2f, '3F': astar_3f}
             q_mgrs = {'2F': self.qm_2f, '3F': self.qm_3f}
             cleaners = {'2F': self.cleaner_2f, '3F': self.cleaner_3f}
+            z_mgrs = {'2F': self.zm_2f, '3F': self.zm_3f} # V66 Zone
             
-            # [新增] 等待計數器，用於偵測死鎖 (V65+)
             wait_counts = defaultdict(int) 
+            consecutive_failures = 0
+            last_failed_station = None
 
             start_real = time.time()
 
@@ -979,6 +1046,7 @@ class AdvancedSimulationRunner:
                 traffic = self.traffic_2f if floor=='2F' else self.traffic_3f
                 parking = self.parking_2f if floor=='2F' else self.parking_2f
                 q_mgr = q_mgrs[floor]
+                z_mgr = z_mgrs[floor] # V66
                 cleaner = cleaners[floor]
                 
                 while queue or cleaner.pending_tasks:
@@ -1018,7 +1086,6 @@ class AdvancedSimulationRunner:
                     task = queue[0]
                     
                     # --- [V65 Feature] 歷史時間鎖 ---
-                    # AGV 雖然有空，但如果現在模擬時間還沒到訂單發生的時間，必須空轉等待
                     task_dt = task.get('datetime')
                     if task_dt:
                         task_relative_sec = (task_dt - self.base_time).total_seconds()
@@ -1028,50 +1095,75 @@ class AdvancedSimulationRunner:
 
                     target_st = task['stops'][-1]['station']
                     
-                    # Physical Queue Check
-                    target_pos, is_ready_to_work = q_mgr.get_target_for_agv(target_st, best_agv)
+                    # [V65 防呆] 樓層檢查
+                    if target_st not in q_mgr.station_queues:
+                        print(f"🚨 [CRITICAL] 樓層錯誤派單！AGV_{best_agv} ({floor}) 接到去 {target_st} 的任務。跳過。")
+                        queue.popleft() 
+                        continue
+
+                    # ----------------------------------------------------
+                    # V66: Zone Control (區域總量管制)
+                    # ----------------------------------------------------
+                    can_enter_zone = z_mgr.can_enter(target_st)
                     
-                    # --- [V65 Feature] 擁擠避讓機制 (Anti-Deadlock) ---
-                    if not target_pos:
+                    if not can_enter_zone:
+                        # 區域客滿，必須等待
                         wait_counts[best_agv] += 1
                         
-                        # 如果等待超過 10 次循環 (約 50 秒)，判定為潛在死鎖，主動避讓
-                        if wait_counts[best_agv] > 10:
-                            # 1. 嘗試尋找一個臨時停車點
-                            refuge_spot = parking.get_fast_parking_spot(agv_pool)
-                            if not refuge_spot:
-                                # 2. 如果車位滿了，嘗試找地圖上隨便一個空位 (Inventory Spot)
-                                cands = self._find_smart_storage_spot(agv_pos, self.valid_storage_spots[floor], set(), self.shelf_occupancy[floor], agv_pool, grid, limit=10)
-                                if cands: refuge_spot = cands[0]
-
-                            if refuge_spot:
-                                # 3. 執行「戰術撤退」移動，把路口讓出來
-                                _, end_t, _ = self._move_agv_segment(
-                                    agv_pos, refuge_spot, current_t, False, f"AGV_{best_agv}",
-                                    floor, astar, shuffler, traffic, w_evt, res_table, grid, reason_label="CONGESTION_BACKOFF"
-                                )
-                                # 4. 更新 AGV 狀態
-                                self.agv_state[floor][best_agv]['pos'] = refuge_spot
-                                self.agv_state[floor][best_agv]['time'] = end_t
-                                wait_counts[best_agv] = 0 # 重置計數器
-                            else:
-                                # 真的完全沒地方去 (極端情況)，只能原地等待
-                                self.agv_state[floor][best_agv]['time'] += 5
-                        else:
-                            # 還沒超過容忍值，原地等待
-                            self.agv_state[floor][best_agv]['time'] += 5
+                        # [V66 Probe] 塞車探針：每 60 次(約300秒) 印出一次警告
+                        if wait_counts[best_agv] > 60 and wait_counts[best_agv] % 60 == 1:
+                            print(f"⚠️ [Traffic] AGV_{best_agv} 在等 {target_st} (目前區域人數: {z_mgr.get_usage(target_st)}/{z_mgr.capacity})")
                         
+                        # [V66 Ghost Buster] 幽靈偵測：如果該站一直滿員，可能是計數器壞了
+                        if last_failed_station == target_st:
+                            consecutive_failures += 1
+                        else:
+                            consecutive_failures = 0
+                            last_failed_station = target_st
+                            
+                        # 如果連續 300 次 (1500秒) 都進不去，強制重置區域計數
+                        if consecutive_failures > 300:
+                            print(f"👻 [Ghost Buster] 偵測到區域 {target_st} 死鎖 (300+ 拒絕)。強制重置 Zone Counter。")
+                            z_mgr.force_reset(target_st)
+                            consecutive_failures = 0
+                        
+                        # 原地等待
+                        self.agv_state[floor][best_agv]['time'] += 5
                         continue
-                    # --------------------------------------------------
                     
-                    # 成功取得排隊位置，重置等待計數器
-                    wait_counts[best_agv] = 0 
+                    # 成功進入 Zone，領取門票
+                    z_mgr.enter(target_st)
+                    wait_counts[best_agv] = 0
+                    consecutive_failures = 0
+                    # ----------------------------------------------------
+
+                    # 1. 站點健康檢測
+                    is_jammed = q_mgr.is_station_jammed(target_st, current_t, threshold=300)
+                    if is_jammed:
+                        target_pos = None
+                    else:
+                        # 2. 正常排隊申請 (此時已有 Zone Ticket，理論上一定有位子，除非物理排隊層也出錯)
+                        target_pos, is_ready_to_work = q_mgr.get_target_for_agv(target_st, best_agv)
                     
-                    task = queue.popleft() # 取出任務
+                    if not target_pos:
+                        # 雖然進了 Zone 但排隊層還是滿的 (不應該發生，除非有幽靈)
+                        # 退回 Zone Ticket，原地等待
+                        z_mgr.exit(target_st) 
+                        wait_counts[best_agv] += 1
+                        if wait_counts[best_agv] > 10:
+                             # 原本的流浪邏輯 (略)，這層保護還是留著
+                             pass 
+                        self.agv_state[floor][best_agv]['time'] += 5
+                        continue
+                    
+                    # 成功取得排隊位置
+                    task = queue.popleft() 
                     
                     shelf_id = task['shelf_id']
                     if shelf_id not in self.shelf_coords: 
-                        done_count += 1; continue
+                        done_count += 1; 
+                        z_mgr.exit(target_st) # 任務異常結束，記得還券
+                        continue
                         
                     shelf_pos = self.shelf_coords[shelf_id]['pos']
                     if grid[shelf_pos[0]][shelf_pos[1]] == -1: shelf_pos = self._get_strict_spawn_spot(grid, set(), floor)
@@ -1090,33 +1182,41 @@ class AdvancedSimulationRunner:
                     current_shelf_pos = shelf_pos
                     
                     # 2. Visit Station (with Queuing)
-                    # We need to reach 'Processing' state
+                    queue_wait_start = current_t
                     while True:
+                        if current_t - queue_wait_start > 600:
+                             w_evt.writerow([self.to_dt(current_t), self.to_dt(current_t), floor, f"AGV_{best_agv}", current_shelf_pos[1], current_shelf_pos[0], current_shelf_pos[1], current_shelf_pos[0], 'FORCE_TELE', 'Queue Stuck'])
+                             self.monitor.log_teleport('QUEUE', 'TimeOut')
+                             q_data = q_mgr.station_queues.get(target_st)
+                             if q_data and best_agv in q_data['occupants']:
+                                idx = q_data['occupants'].index(best_agv)
+                                q_data['occupants'][idx] = None
+                             break
+
                         next_q_pos, is_processing = q_mgr.get_target_for_agv(target_st, best_agv)
                         
                         if not next_q_pos:
                             current_t += 5; continue
                             
-                        # Move to assigned slot
                         current_shelf_pos, current_t, tele_2 = self._move_agv_segment(
                             current_shelf_pos, next_q_pos, current_t, True, f"AGV_{best_agv}",
                             floor, astar, shuffler, traffic, w_evt, res_table, grid, reason_label="QUEUE"
                         )
                         
-                        # Update Manager
                         q_mgr.update_position(target_st, best_agv, next_q_pos)
                         
                         if is_processing:
-                            break # Reached (r, 1), start work
+                            break 
                         else:
-                            # Reached queue slot, wait a bit then check again
                             current_t += 5
                     
                     # Arrived at Station Processing
-                    if tele_2: stats['Visit'] += 1 # Count as visit
+                    if tele_2: stats['Visit'] += 1 
                     self.monitor.log_success('Visit')
                     
-                    stop_time = task['stops'][0]['time'] # Assume 1 stop
+                    q_mgr.set_processing_time(target_st, current_t)
+
+                    stop_time = task['stops'][0]['time'] 
                     leave_t = current_t + stop_time
                     wid = task['wave_id']
                     w_type = "IN" if "RECEIVING" in str(wid) else "OUT"
@@ -1125,11 +1225,14 @@ class AdvancedSimulationRunner:
                     for t in range(current_t, int(leave_t)): res_table[t].add(current_shelf_pos)
                     current_t = int(leave_t)
                     
-                    # Release Station & Exit Strategy
+                    # Release Station
                     q_mgr.release_station(target_st, best_agv)
+                    
+                    # [V66] 任務完成，離開區域，歸還門票 (Exit Zone)
+                    z_mgr.exit(target_st)
+
                     exit_pos = q_mgr.get_exit_spot(target_st)
                     
-                    # Move to Exit Spot first (Side Exit)
                     if exit_pos:
                         current_shelf_pos, current_t, _ = self._move_agv_segment(
                             current_shelf_pos, exit_pos, current_t, True, f"AGV_{best_agv}",
@@ -1161,18 +1264,13 @@ class AdvancedSimulationRunner:
                     self.agv_state[floor][best_agv]['pos'] = drop_pos
                     self.agv_state[floor][best_agv]['time'] = current_t
                         
-                    # ---------------------------------------------------------
-                    # 4. Park (修正版：找不到車位時的流浪機制)
-                    # ---------------------------------------------------------
+                    # 4. Park
                     park_spot = parking.get_fast_parking_spot(agv_pool)
                     
-                    # [新增機制] 如果正式停車位滿了，啟動「流浪模式」找任意空位
                     if not park_spot:
-                        # 嘗試在全地圖找隨便一個空位 (Inventory Spot or Empty Cell)
-                        # 參數說明: limit=10 (找10個候選), range=無限
                         fallback_cands = self._find_smart_storage_spot(
                             drop_pos, 
-                            self.valid_storage_spots[floor], # 搜尋所有合法的料架格
+                            self.valid_storage_spots[floor], 
                             {s['pos'] for k,s in agv_pool.items()}, 
                             self.shelf_occupancy[floor], 
                             agv_pool, 
@@ -1196,7 +1294,6 @@ class AdvancedSimulationRunner:
                             stats['Park'] += 1
                             self.monitor.log_success('Park')
                     else:
-                        # 真的連流浪的地方都沒有 (全地圖爆滿)，這才紀錄 Error
                         self.monitor.log_teleport('PARK', 'NoSpot')
 
 
