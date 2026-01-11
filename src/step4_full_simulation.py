@@ -382,9 +382,9 @@ class ParkingManager:
             attempts += 1
         return None
 
-# [V66 Feature] Zone Manager 區域總量管制
+# [V67 Feature] Zone Manager 總量管制 (Capacity -> 4)
 class ZoneManager:
-    def __init__(self, stations_info, capacity=6):
+    def __init__(self, stations_info, capacity=4): # [修正] 預設為 4
         self.zones = {} # {sid: current_count}
         self.capacity = capacity
         for sid in stations_info:
@@ -418,7 +418,9 @@ class PhysicalQueueManager:
         for sid, info in stations_info.items():
             r, c = info['pos']
             q_slots = []
-            for col in range(2, 7): # Col 2-6
+            # [修正] 縮減排隊格：原本 range(2, 7) -> 改為 range(2, 5)
+            # 這樣只有 Col 2, 3, 4 (3格) + Processing (1格) = 總共 4 格
+            for col in range(2, 5): 
                 q_slots.append((r, col))
             
             exits = [(r-1, 1), (r+1, 1)]
@@ -627,7 +629,7 @@ class LiveMonitor:
 
 class AdvancedSimulationRunner:
     def __init__(self):
-        print(f"🚀 [Step 4] 啟動進階模擬 (V66: Zone Control & Traffic Monitor)...")
+        print(f"🚀 [Step 4] 啟動進階模擬 (V67: Strict Capacity 4)...")
         
         self.grid_2f = self._load_map_correct('2F_map.xlsx', 32, 61)
         self.grid_3f = self._load_map_correct('3F_map.xlsx', 32, 61)
@@ -692,9 +694,9 @@ class AdvancedSimulationRunner:
         self.qm_2f = PhysicalQueueManager(st_2f)
         self.qm_3f = PhysicalQueueManager(st_3f)
         
-        # [V66] 區域管制 (Zone Manager)
-        self.zm_2f = ZoneManager(st_2f, capacity=6)
-        self.zm_3f = ZoneManager(st_3f, capacity=6)
+        # [V67] 區域管制 (Zone Manager): 容量縮減為 4
+        self.zm_2f = ZoneManager(st_2f, capacity=4)
+        self.zm_3f = ZoneManager(st_3f, capacity=4)
         
         self.wave_totals = {}
         self.recv_totals = {}
@@ -977,7 +979,18 @@ class AdvancedSimulationRunner:
 
             if path:
                 self.write_move_events(w_evt, path, floor, agv_name.replace("AGV_", ""), res_table)
-                t = path[-1][1]
+                
+                # [V67 Fix] 停車視盲修正：
+                # 抵達目的地後，強制預約未來 120 秒的佔用。
+                # 這會讓其他正在算路徑的車，知道這個位子在未來很長一段時間都是「牆壁」，絕對不能排進來。
+                arrival_t = path[-1][1]
+                arrival_pos = path[-1][0]
+                
+                # 鎖定未來 2 分鐘 (或直到下一次移動解鎖)
+                for lock_t in range(arrival_t, arrival_t + 120):
+                    res_table[lock_t].add(arrival_pos)
+
+                t = arrival_t
                 curr = target
             else:
                 backoff_time = min(2 ** retry_count, 5) 
@@ -1015,7 +1028,7 @@ class AdvancedSimulationRunner:
                 
             total_tasks = len(task_queue_2f) + len(task_queue_3f)
             
-            print(f"🎬 開始模擬... (V66: Zone Control & Traffic Monitor)...")
+            print(f"🎬 開始模擬... (V67: Strict Capacity 4)...")
             print(f"   -> 原始訂單: {len(self.all_tasks_raw)} | AGV任務: {total_tasks}")
             
             for floor in ['2F', '3F']:
