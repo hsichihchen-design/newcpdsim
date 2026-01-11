@@ -72,7 +72,7 @@ class TimeAwareAStar:
         NORMAL_COST = 1      
         TURNING_COST = 1.0   
         WAIT_COST = 1.0       
-        TUNNEL_COST = 50.0 
+        TUNNEL_COST = 50.0  # 穿牆的高昂代價
 
         while open_set:
             steps += 1
@@ -81,6 +81,7 @@ class TimeAwareAStar:
             f, h, current_time, current, last_move = heapq.heappop(open_set)
 
             if current == goal:
+                # 這裡會呼叫 _reconstruct_path
                 return self._reconstruct_path(came_from, (current, current_time, last_move), start, start_time_sec)
 
             for dr, dc in self.moves:
@@ -92,6 +93,7 @@ class TimeAwareAStar:
                     
                     step_cost = NORMAL_COST
 
+                    # --- 動態障礙檢查 (Dynamic Reservations) ---
                     if not ignore_dynamic:
                         if (next_time - start_time_sec) < 60: 
                             if next_time in self.reservations:
@@ -101,14 +103,26 @@ class TimeAwareAStar:
                                        (current in self.reservations[next_time]):
                                         continue
 
+                    # --- 靜態料架檢查 (Shelf Occupancy) ---
                     is_spot_occupied = ((nr, nc) in self.shelf_occupancy)
                     
-                    if is_loaded and is_spot_occupied:
-                        if (nr, nc) != goal and (nr, nc) != start:
-                            if allow_tunneling: step_cost += TUNNEL_COST 
-                            else: continue 
-                    elif not is_loaded and is_spot_occupied:
-                        step_cost += NORMAL_COST * 3
+                    if is_loaded:
+                        # [載貨邏輯]
+                        if is_spot_occupied:
+                            # 1. 如果是起點或終點，允許
+                            if (nr, nc) == goal or (nr, nc) == start:
+                                pass 
+                            # 2. 如果開啟了 allow_tunneling (救命模式)，允許穿牆但代價極高
+                            elif allow_tunneling:
+                                step_cost += TUNNEL_COST
+                            # 3. 否則嚴禁碰撞
+                            else:
+                                continue 
+                    else:
+                        # [空車邏輯]
+                        if is_spot_occupied:
+                            # 允許鑽入料架下方，稍微增加一點成本 (模擬減速小心駕駛)
+                            step_cost += 0.5
 
                     if dr == 0 and dc == 0: step_cost += WAIT_COST
                     elif (dr, dc) != last_move and last_move != (0,0): step_cost += TURNING_COST
@@ -126,6 +140,7 @@ class TimeAwareAStar:
                         
         return None, None
 
+    # [補回] 這個函式之前漏掉了
     def _reconstruct_path(self, came_from, current_node, start_pos, start_time):
         path = []
         curr = current_node
@@ -137,6 +152,7 @@ class TimeAwareAStar:
         path.reverse()
         return path, path[-1][1]
 
+
 class TrafficController:
     def __init__(self, grid, agv_state_pool, reservations):
         self.grid = grid
@@ -144,7 +160,6 @@ class TrafficController:
         self.agv_pool = agv_state_pool 
         self.reservations = reservations
 
-    # [V62 Fix] Restored clear_path_obstacles
     def clear_path_obstacles(self, start_pos, goal_pos, current_time, w_evt, floor, my_agv_name):
         blocker_id = None
         blocker_pos = None
@@ -213,9 +228,6 @@ class TrafficController:
         return None
 
     def attempt_backtrack(self, current_pos, goal_pos, current_time, w_evt, floor, agv_name):
-        """
-        [V61] Tactical Retreat Logic
-        """
         best_retreat = None
         max_dist = -1
         
@@ -363,7 +375,6 @@ class ParkingManager:
     def __init__(self, grid, valid_storage_spots, shelf_occupancy):
         self.grid = grid
         self.rows, self.cols = grid.shape
-        self.shelf_occupancy = shelf_occupancy
         self.valid_spots_list = list(valid_storage_spots)
     
     def get_fast_parking_spot(self, agv_pool):
@@ -371,7 +382,10 @@ class ParkingManager:
         occupied_by_agvs = {s['pos'] for s in agv_pool.values()}
         while attempts < 20:
             spot = random.choice(self.valid_spots_list)
-            if spot not in self.shelf_occupancy and spot not in occupied_by_agvs:
+            
+            # [修正] 只要沒有「其他 AGV」，就可以停！
+            # 不再檢查 spot not in self.shelf_occupancy
+            if spot not in occupied_by_agvs:
                 return spot
             attempts += 1
         return None
@@ -480,7 +494,8 @@ class OrderProcessor:
             shelf_tasks[shelf_id].append({
                 'face': face, 'station': target_st,
                 'sku': f"{row.get('FRCD','')}_{row.get('PARTNO','')}",
-                'qty': row.get('QTY', 1), 'order_row': row
+                'qty': row.get('QTY', 1), 'order_row': row,
+                'datetime': row.get('datetime', None) # Pass datetime to task
             })
         final_tasks = []
         for shelf_id, orders in shelf_tasks.items():
@@ -489,10 +504,15 @@ class OrderProcessor:
             current_st = None
             current_face = None
             current_sku_group = defaultdict(int) 
+            # Use the earliest order time as the task time
+            task_dt = orders[0]['datetime'] 
+            
             for o in orders:
                 st = o['station']
                 face = o['face']
                 sku = o['sku']
+                if o['datetime'] < task_dt: task_dt = o['datetime']
+                
                 if (st != current_st or face != current_face) and current_st is not None:
                     proc_time = self._calc_time(current_sku_group)
                     stops.append({'station': current_st, 'face': current_face, 'time': proc_time})
@@ -506,7 +526,8 @@ class OrderProcessor:
             final_tasks.append({
                 'shelf_id': shelf_id, 'stops': stops,
                 'wave_id': orders[0]['order_row'].get('WAVE_ID'),
-                'raw_orders': [o['order_row'] for o in orders]
+                'raw_orders': [o['order_row'] for o in orders],
+                'datetime': task_dt # Add datetime to the consolidated task
             })
         return final_tasks
 
@@ -539,7 +560,7 @@ class LiveMonitor:
 
 class AdvancedSimulationRunner:
     def __init__(self):
-        print(f"🚀 [Step 4] 啟動進階模擬 (V62: Fixed Traffic Controller)...")
+        print(f"🚀 [Step 4] 啟動進階模擬 (V65: Historical Time Lock)...")
         
         self.grid_2f = self._load_map_correct('2F_map.xlsx', 32, 61)
         self.grid_3f = self._load_map_correct('3F_map.xlsx', 32, 61)
@@ -831,7 +852,6 @@ class AdvancedSimulationRunner:
 
         while curr != target:
             if t - start_wait > TIMEOUT_LIMIT:
-                # [V61] Tactical Retreat Logic
                 success, retreat_pos, retreat_time = traffic_ctrl.attempt_backtrack(curr, target, t, w_evt, floor, agv_name)
                 if success:
                     curr = retreat_pos
@@ -898,241 +918,308 @@ class AdvancedSimulationRunner:
         return curr, t, False
 
     def run(self):
-        if not self.all_tasks_raw: return
-        self.base_time = self.all_tasks_raw[0]['datetime']
-        self.to_dt = lambda sec: self.base_time + timedelta(seconds=sec)
-        
-        astar_2f = TimeAwareAStar(self.grid_2f, self.reservations_2f, self.shelf_occupancy['2F'])
-        astar_3f = TimeAwareAStar(self.grid_3f, self.reservations_3f, self.shelf_occupancy['3F'])
-        
-        w_evt = BatchWriter(os.path.join(LOG_DIR, 'simulation_events.csv'), ['start_time', 'end_time', 'floor', 'obj_id', 'sx', 'sy', 'ex', 'ey', 'type', 'text'])
-        f_kpi = open(os.path.join(LOG_DIR, 'simulation_kpi.csv'), 'w', newline='', encoding='utf-8')
-        w_kpi = csv.writer(f_kpi)
-        w_kpi.writerow(['finish_time', 'type', 'wave_id', 'is_delayed', 'date', 'workstation', 'total_in_wave', 'deadline_ts'])
-
-        df_tasks = pd.DataFrame(self.all_tasks_raw)
-        grouped_waves = df_tasks.groupby('WAVE_ID')
-        
-        task_queue_2f = deque()
-        task_queue_3f = deque()
-        
-        for wave_id, wave_df in grouped_waves:
-            wave_2f = wave_df[wave_df['LOC'].str.startswith('2')].copy()
-            wave_3f = wave_df[wave_df['LOC'].str.startswith('3')].copy()
-            task_queue_2f.extend(self.processor.process_wave(wave_2f, '2F'))
-            task_queue_3f.extend(self.processor.process_wave(wave_3f, '3F'))
+            if not self.all_tasks_raw: return
+            self.base_time = self.all_tasks_raw[0]['datetime']
+            self.to_dt = lambda sec: self.base_time + timedelta(seconds=sec)
             
-        total_tasks = len(task_queue_2f) + len(task_queue_3f)
-        
-        print(f"🎬 開始模擬... (V62: Fixed Traffic Controller)...")
-        print(f"   -> 原始訂單: {len(self.all_tasks_raw)} | AGV任務: {total_tasks}")
-        
-        for floor in ['2F', '3F']:
-            for sid, info in self.stations.items():
-                if info['floor'] == floor:
-                    display_id = sid.split('_')[1] 
-                    w_evt.writerow([self.to_dt(0), self.to_dt(1), floor, f"WS_{sid}", info['pos'][1], info['pos'][0], info['pos'][1], info['pos'][0], 'STATION_STATUS', f'WHITE|IDLE|Waiting'])
-            for agv_id, state in self.agv_state[floor].items():
-                pos = state['pos']
-                w_evt.writerow([self.to_dt(0), self.to_dt(1), floor, f"AGV_{agv_id}", pos[1], pos[0], pos[1], pos[0], 'AGV_MOVE', 'INIT'])
-
-        done_count = 0
-        stats = {'Load': 0, 'Visit': 0, 'Return': 0, 'Park': 0}
-        
-        queues = {'2F': task_queue_2f, '3F': task_queue_3f}
-        astars = {'2F': astar_2f, '3F': astar_3f}
-        q_mgrs = {'2F': self.qm_2f, '3F': self.qm_3f}
-        cleaners = {'2F': self.cleaner_2f, '3F': self.cleaner_3f}
-        
-        start_real = time.time()
-
-        for floor in ['2F', '3F']:
-            queue = queues[floor]
-            astar = astars[floor]
-            agv_pool = self.agv_state[floor]
-            res_table = self.reservations_2f if floor=='2F' else self.reservations_3f
-            grid = self.grid_2f if floor=='2F' else self.grid_3f
-            shuffler = self.shuffler_2f if floor=='2F' else self.shuffler_3f
-            traffic = self.traffic_2f if floor=='2F' else self.traffic_3f
-            parking = self.parking_2f if floor=='2F' else self.parking_2f
-            q_mgr = q_mgrs[floor]
-            cleaner = cleaners[floor]
+            astar_2f = TimeAwareAStar(self.grid_2f, self.reservations_2f, self.shelf_occupancy['2F'])
+            astar_3f = TimeAwareAStar(self.grid_3f, self.reservations_3f, self.shelf_occupancy['3F'])
             
-            while queue or cleaner.pending_tasks:
-                best_agv = min(agv_pool, key=lambda k: agv_pool[k]['time'])
-                agv_ready_time = agv_pool[best_agv]['time']
-                agv_pos = agv_pool[best_agv]['pos']
-                if grid[agv_pos[0]][agv_pos[1]] == -1: agv_pos = self._get_strict_spawn_spot(grid, set(), floor)
-                current_t = agv_ready_time
-                
-                # Cleanup Priority
-                cleanup_task = cleaner.get_nearest_task(agv_pos)
-                if cleanup_task:
-                    buf_pos, orig_pos, sid = cleanup_task
-                    path, end_t = astar.find_path(agv_pos, buf_pos, current_t, False, ignore_dynamic=True)
-                    if path:
-                        self.write_move_events(w_evt, path, floor, f"{best_agv}", res_table)
-                        w_evt.writerow([self.to_dt(end_t), self.to_dt(end_t+5), floor, f"AGV_{best_agv}", buf_pos[1], buf_pos[0], buf_pos[1], buf_pos[0], 'SHUFFLE_LOAD', f"Restore {sid}"])
-                        if buf_pos in self.shelf_occupancy: self.shelf_occupancy.remove(buf_pos)
-                        t2 = end_t + 5
-                        
-                        path2, end_t2 = astar.find_path(buf_pos, orig_pos, t2, True, ignore_dynamic=True, allow_tunneling=True)
-                        if path2:
-                            self.write_move_events(w_evt, path2, floor, f"{best_agv}", res_table)
-                            w_evt.writerow([self.to_dt(end_t2), self.to_dt(end_t2+5), floor, f"AGV_{best_agv}", orig_pos[1], orig_pos[0], orig_pos[1], orig_pos[0], 'SHUFFLE_UNLOAD', f"Restored {sid}"])
-                            self.shelf_occupancy[floor].add(orig_pos)
-                            if sid != "Unknown" and sid in self.shelf_coords: self.shelf_coords[sid]['pos'] = orig_pos
-                            if sid != "Unknown":
-                                if floor == '2F': self.pos_to_sid_2f[orig_pos] = sid
-                                else: self.pos_to_sid_3f[orig_pos] = sid
-                            self.agv_state[floor][best_agv]['pos'] = orig_pos
-                            self.agv_state[floor][best_agv]['time'] = end_t2 + 5
-                            continue 
-                
-                if not queue: break
-                
-                # Peek Task & Station
-                task = queue[0] 
-                target_st = task['stops'][-1]['station']
-                
-                # [V61] Physical Queue Check
-                target_pos, is_ready_to_work = q_mgr.get_target_for_agv(target_st, best_agv)
-                
-                if not target_pos:
-                    self.agv_state[floor][best_agv]['time'] += 5
-                    continue
-                
-                task = queue.popleft() # Take it
-                
-                shelf_id = task['shelf_id']
-                if shelf_id not in self.shelf_coords: 
-                    done_count += 1; continue
-                    
-                shelf_pos = self.shelf_coords[shelf_id]['pos']
-                if grid[shelf_pos[0]][shelf_pos[1]] == -1: shelf_pos = self._get_strict_spawn_spot(grid, set(), floor)
+            w_evt = BatchWriter(os.path.join(LOG_DIR, 'simulation_events.csv'), ['start_time', 'end_time', 'floor', 'obj_id', 'sx', 'sy', 'ex', 'ey', 'type', 'text'])
+            f_kpi = open(os.path.join(LOG_DIR, 'simulation_kpi.csv'), 'w', newline='', encoding='utf-8')
+            w_kpi = csv.writer(f_kpi)
+            w_kpi.writerow(['finish_time', 'type', 'wave_id', 'is_delayed', 'date', 'workstation', 'total_in_wave', 'deadline_ts'])
 
-                # 1. Load Shelf
-                agv_pos, current_t, tele_1 = self._move_agv_segment(
-                    agv_pos, shelf_pos, current_t, False, f"AGV_{best_agv}", 
-                    floor, astar, shuffler, traffic, w_evt, res_table, grid, reason_label="LOAD"
-                )
-                if tele_1: stats['Load'] += 1
-                self.monitor.log_success('Load')
+            df_tasks = pd.DataFrame(self.all_tasks_raw)
+            grouped_waves = df_tasks.groupby('WAVE_ID')
+            
+            task_queue_2f = deque()
+            task_queue_3f = deque()
+            
+            for wave_id, wave_df in grouped_waves:
+                wave_2f = wave_df[wave_df['LOC'].str.startswith('2')].copy()
+                wave_3f = wave_df[wave_df['LOC'].str.startswith('3')].copy()
+                task_queue_2f.extend(self.processor.process_wave(wave_2f, '2F'))
+                task_queue_3f.extend(self.processor.process_wave(wave_3f, '3F'))
                 
-                w_evt.writerow([self.to_dt(current_t), self.to_dt(current_t+5), floor, f"AGV_{best_agv}", shelf_pos[1], shelf_pos[0], shelf_pos[1], shelf_pos[0], 'SHELF_LOAD', f"Task_{done_count}"])
-                current_t += 5
-                if shelf_pos in self.shelf_occupancy[floor]: self.shelf_occupancy[floor].remove(shelf_pos)
-                current_shelf_pos = shelf_pos
+            total_tasks = len(task_queue_2f) + len(task_queue_3f)
+            
+            print(f"🎬 開始模擬... (V65: Time Lock + Congestion Relief)...")
+            print(f"   -> 原始訂單: {len(self.all_tasks_raw)} | AGV任務: {total_tasks}")
+            
+            for floor in ['2F', '3F']:
+                for sid, info in self.stations.items():
+                    if info['floor'] == floor:
+                        display_id = sid.split('_')[1] 
+                        w_evt.writerow([self.to_dt(0), self.to_dt(1), floor, f"WS_{sid}", info['pos'][1], info['pos'][0], info['pos'][1], info['pos'][0], 'STATION_STATUS', f'WHITE|IDLE|Waiting'])
+                for agv_id, state in self.agv_state[floor].items():
+                    pos = state['pos']
+                    w_evt.writerow([self.to_dt(0), self.to_dt(1), floor, f"AGV_{agv_id}", pos[1], pos[0], pos[1], pos[0], 'AGV_MOVE', 'INIT'])
+
+            done_count = 0
+            stats = {'Load': 0, 'Visit': 0, 'Return': 0, 'Park': 0}
+            
+            queues = {'2F': task_queue_2f, '3F': task_queue_3f}
+            astars = {'2F': astar_2f, '3F': astar_3f}
+            q_mgrs = {'2F': self.qm_2f, '3F': self.qm_3f}
+            cleaners = {'2F': self.cleaner_2f, '3F': self.cleaner_3f}
+            
+            # [新增] 等待計數器，用於偵測死鎖 (V65+)
+            wait_counts = defaultdict(int) 
+
+            start_real = time.time()
+
+            for floor in ['2F', '3F']:
+                queue = queues[floor]
+                astar = astars[floor]
+                agv_pool = self.agv_state[floor]
+                res_table = self.reservations_2f if floor=='2F' else self.reservations_3f
+                grid = self.grid_2f if floor=='2F' else self.grid_3f
+                shuffler = self.shuffler_2f if floor=='2F' else self.shuffler_3f
+                traffic = self.traffic_2f if floor=='2F' else self.traffic_3f
+                parking = self.parking_2f if floor=='2F' else self.parking_2f
+                q_mgr = q_mgrs[floor]
+                cleaner = cleaners[floor]
                 
-                # 2. Visit Station (with Queuing)
-                # We need to reach 'Processing' state
-                while True:
-                    next_q_pos, is_processing = q_mgr.get_target_for_agv(target_st, best_agv)
+                while queue or cleaner.pending_tasks:
+                    best_agv = min(agv_pool, key=lambda k: agv_pool[k]['time'])
+                    agv_ready_time = agv_pool[best_agv]['time']
+                    agv_pos = agv_pool[best_agv]['pos']
+                    if grid[agv_pos[0]][agv_pos[1]] == -1: agv_pos = self._get_strict_spawn_spot(grid, set(), floor)
+                    current_t = agv_ready_time
                     
-                    if not next_q_pos:
-                        current_t += 5; continue
+                    # Cleanup Priority (閒置車支援搬運路障)
+                    cleanup_task = cleaner.get_nearest_task(agv_pos)
+                    if cleanup_task:
+                        buf_pos, orig_pos, sid = cleanup_task
+                        path, end_t = astar.find_path(agv_pos, buf_pos, current_t, False, ignore_dynamic=True)
+                        if path:
+                            self.write_move_events(w_evt, path, floor, f"{best_agv}", res_table)
+                            w_evt.writerow([self.to_dt(end_t), self.to_dt(end_t+5), floor, f"AGV_{best_agv}", buf_pos[1], buf_pos[0], buf_pos[1], buf_pos[0], 'SHUFFLE_LOAD', f"Restore {sid}"])
+                            if buf_pos in self.shelf_occupancy: self.shelf_occupancy.remove(buf_pos)
+                            t2 = end_t + 5
+                            
+                            path2, end_t2 = astar.find_path(buf_pos, orig_pos, t2, True, ignore_dynamic=True, allow_tunneling=True)
+                            if path2:
+                                self.write_move_events(w_evt, path2, floor, f"{best_agv}", res_table)
+                                w_evt.writerow([self.to_dt(end_t2), self.to_dt(end_t2+5), floor, f"AGV_{best_agv}", orig_pos[1], orig_pos[0], orig_pos[1], orig_pos[0], 'SHUFFLE_UNLOAD', f"Restored {sid}"])
+                                self.shelf_occupancy[floor].add(orig_pos)
+                                if sid != "Unknown" and sid in self.shelf_coords: self.shelf_coords[sid]['pos'] = orig_pos
+                                if sid != "Unknown":
+                                    if floor == '2F': self.pos_to_sid_2f[orig_pos] = sid
+                                    else: self.pos_to_sid_3f[orig_pos] = sid
+                                self.agv_state[floor][best_agv]['pos'] = orig_pos
+                                self.agv_state[floor][best_agv]['time'] = end_t2 + 5
+                                continue 
+                    
+                    if not queue: break
+                    
+                    # Peek Task
+                    task = queue[0]
+                    
+                    # --- [V65 Feature] 歷史時間鎖 ---
+                    # AGV 雖然有空，但如果現在模擬時間還沒到訂單發生的時間，必須空轉等待
+                    task_dt = task.get('datetime')
+                    if task_dt:
+                        task_relative_sec = (task_dt - self.base_time).total_seconds()
+                        if current_t < task_relative_sec:
+                            current_t = int(task_relative_sec)
+                    # --------------------------------
+
+                    target_st = task['stops'][-1]['station']
+                    
+                    # Physical Queue Check
+                    target_pos, is_ready_to_work = q_mgr.get_target_for_agv(target_st, best_agv)
+                    
+                    # --- [V65 Feature] 擁擠避讓機制 (Anti-Deadlock) ---
+                    if not target_pos:
+                        wait_counts[best_agv] += 1
                         
-                    # Move to assigned slot
-                    current_shelf_pos, current_t, tele_2 = self._move_agv_segment(
-                        current_shelf_pos, next_q_pos, current_t, True, f"AGV_{best_agv}",
-                        floor, astar, shuffler, traffic, w_evt, res_table, grid, reason_label="QUEUE"
+                        # 如果等待超過 10 次循環 (約 50 秒)，判定為潛在死鎖，主動避讓
+                        if wait_counts[best_agv] > 10:
+                            # 1. 嘗試尋找一個臨時停車點
+                            refuge_spot = parking.get_fast_parking_spot(agv_pool)
+                            if not refuge_spot:
+                                # 2. 如果車位滿了，嘗試找地圖上隨便一個空位 (Inventory Spot)
+                                cands = self._find_smart_storage_spot(agv_pos, self.valid_storage_spots[floor], set(), self.shelf_occupancy[floor], agv_pool, grid, limit=10)
+                                if cands: refuge_spot = cands[0]
+
+                            if refuge_spot:
+                                # 3. 執行「戰術撤退」移動，把路口讓出來
+                                _, end_t, _ = self._move_agv_segment(
+                                    agv_pos, refuge_spot, current_t, False, f"AGV_{best_agv}",
+                                    floor, astar, shuffler, traffic, w_evt, res_table, grid, reason_label="CONGESTION_BACKOFF"
+                                )
+                                # 4. 更新 AGV 狀態
+                                self.agv_state[floor][best_agv]['pos'] = refuge_spot
+                                self.agv_state[floor][best_agv]['time'] = end_t
+                                wait_counts[best_agv] = 0 # 重置計數器
+                            else:
+                                # 真的完全沒地方去 (極端情況)，只能原地等待
+                                self.agv_state[floor][best_agv]['time'] += 5
+                        else:
+                            # 還沒超過容忍值，原地等待
+                            self.agv_state[floor][best_agv]['time'] += 5
+                        
+                        continue
+                    # --------------------------------------------------
+                    
+                    # 成功取得排隊位置，重置等待計數器
+                    wait_counts[best_agv] = 0 
+                    
+                    task = queue.popleft() # 取出任務
+                    
+                    shelf_id = task['shelf_id']
+                    if shelf_id not in self.shelf_coords: 
+                        done_count += 1; continue
+                        
+                    shelf_pos = self.shelf_coords[shelf_id]['pos']
+                    if grid[shelf_pos[0]][shelf_pos[1]] == -1: shelf_pos = self._get_strict_spawn_spot(grid, set(), floor)
+
+                    # 1. Load Shelf
+                    agv_pos, current_t, tele_1 = self._move_agv_segment(
+                        agv_pos, shelf_pos, current_t, False, f"AGV_{best_agv}", 
+                        floor, astar, shuffler, traffic, w_evt, res_table, grid, reason_label="LOAD"
                     )
+                    if tele_1: stats['Load'] += 1
+                    self.monitor.log_success('Load')
                     
-                    # Update Manager
-                    q_mgr.update_position(target_st, best_agv, next_q_pos)
+                    w_evt.writerow([self.to_dt(current_t), self.to_dt(current_t+5), floor, f"AGV_{best_agv}", shelf_pos[1], shelf_pos[0], shelf_pos[1], shelf_pos[0], 'SHELF_LOAD', f"Task_{done_count}"])
+                    current_t += 5
+                    if shelf_pos in self.shelf_occupancy[floor]: self.shelf_occupancy[floor].remove(shelf_pos)
+                    current_shelf_pos = shelf_pos
                     
-                    if is_processing:
-                        break # Reached (r, 1), start work
+                    # 2. Visit Station (with Queuing)
+                    # We need to reach 'Processing' state
+                    while True:
+                        next_q_pos, is_processing = q_mgr.get_target_for_agv(target_st, best_agv)
+                        
+                        if not next_q_pos:
+                            current_t += 5; continue
+                            
+                        # Move to assigned slot
+                        current_shelf_pos, current_t, tele_2 = self._move_agv_segment(
+                            current_shelf_pos, next_q_pos, current_t, True, f"AGV_{best_agv}",
+                            floor, astar, shuffler, traffic, w_evt, res_table, grid, reason_label="QUEUE"
+                        )
+                        
+                        # Update Manager
+                        q_mgr.update_position(target_st, best_agv, next_q_pos)
+                        
+                        if is_processing:
+                            break # Reached (r, 1), start work
+                        else:
+                            # Reached queue slot, wait a bit then check again
+                            current_t += 5
+                    
+                    # Arrived at Station Processing
+                    if tele_2: stats['Visit'] += 1 # Count as visit
+                    self.monitor.log_success('Visit')
+                    
+                    stop_time = task['stops'][0]['time'] # Assume 1 stop
+                    leave_t = current_t + stop_time
+                    wid = task['wave_id']
+                    w_type = "IN" if "RECEIVING" in str(wid) else "OUT"
+                    w_evt.writerow([self.to_dt(current_t), self.to_dt(leave_t), floor, f"WS_{target_st}", current_shelf_pos[1], current_shelf_pos[0], current_shelf_pos[1], current_shelf_pos[0], 'STATION_STATUS', f'BLUE|{w_type}|{wid}'])
+                    w_evt.writerow([self.to_dt(current_t), self.to_dt(leave_t), floor, f"AGV_{best_agv}", current_shelf_pos[1], current_shelf_pos[0], current_shelf_pos[1], current_shelf_pos[0], 'PICKING', f"Processing"])
+                    for t in range(current_t, int(leave_t)): res_table[t].add(current_shelf_pos)
+                    current_t = int(leave_t)
+                    
+                    # Release Station & Exit Strategy
+                    q_mgr.release_station(target_st, best_agv)
+                    exit_pos = q_mgr.get_exit_spot(target_st)
+                    
+                    # Move to Exit Spot first (Side Exit)
+                    if exit_pos:
+                        current_shelf_pos, current_t, _ = self._move_agv_segment(
+                            current_shelf_pos, exit_pos, current_t, True, f"AGV_{best_agv}",
+                            floor, astar, shuffler, traffic, w_evt, res_table, grid, reason_label="EXIT"
+                        )
+                    
+                    # 3. Return
+                    candidates = self._find_smart_storage_spot(
+                        current_shelf_pos, self.valid_storage_spots[floor], 
+                        {s['pos'] for k,s in agv_pool.items()}, self.shelf_occupancy[floor], agv_pool, grid, limit=20
+                    )
+                    if not candidates: candidates = [shelf_pos]
+                    drop_pos = candidates[0]
+                    if grid[drop_pos[0]][drop_pos[1]] == -1: drop_pos = self._get_strict_spawn_spot(grid, set(), floor)
+
+                    current_shelf_pos, current_t, tele_3 = self._move_agv_segment(
+                        current_shelf_pos, drop_pos, current_t, True, f"AGV_{best_agv}",
+                        floor, astar, shuffler, traffic, w_evt, res_table, grid,
+                        is_returning=True, agv_pool=agv_pool, reason_label="RETURN"
+                    )
+                    if tele_3: stats['Return'] += 1
+                    self.monitor.log_success('Return')
+
+                    w_evt.writerow([self.to_dt(current_t), self.to_dt(current_t+5), floor, f"AGV_{best_agv}", drop_pos[1], drop_pos[0], drop_pos[1], drop_pos[0], 'SHELF_UNLOAD', 'Done'])
+                    current_t += 5
+                    
+                    self.shelf_occupancy[floor].add(drop_pos)
+                    self.shelf_coords[shelf_id]['pos'] = drop_pos
+                    self.agv_state[floor][best_agv]['pos'] = drop_pos
+                    self.agv_state[floor][best_agv]['time'] = current_t
+                        
+                    # ---------------------------------------------------------
+                    # 4. Park (修正版：找不到車位時的流浪機制)
+                    # ---------------------------------------------------------
+                    park_spot = parking.get_fast_parking_spot(agv_pool)
+                    
+                    # [新增機制] 如果正式停車位滿了，啟動「流浪模式」找任意空位
+                    if not park_spot:
+                        # 嘗試在全地圖找隨便一個空位 (Inventory Spot or Empty Cell)
+                        # 參數說明: limit=10 (找10個候選), range=無限
+                        fallback_cands = self._find_smart_storage_spot(
+                            drop_pos, 
+                            self.valid_storage_spots[floor], # 搜尋所有合法的料架格
+                            {s['pos'] for k,s in agv_pool.items()}, 
+                            self.shelf_occupancy[floor], 
+                            agv_pool, 
+                            grid, 
+                            limit=5
+                        )
+                        if fallback_cands:
+                            park_spot = fallback_cands[0]
+                            print(f"⚠️ AGV_{best_agv} 找不到停車位，暫時前往流浪點 {park_spot}")
+
+                    if park_spot:
+                        current_shelf_pos, current_t, tele_4 = self._move_agv_segment(
+                            drop_pos, park_spot, current_t, False, f"AGV_{best_agv}",
+                            floor, astar, shuffler, traffic, w_evt, res_table, grid, 
+                            is_returning=False, agv_pool=agv_pool, reason_label="PARK_FINAL"
+                        )
+                        if not tele_4:
+                            self.agv_state[floor][best_agv]['pos'] = park_spot
+                            self.agv_state[floor][best_agv]['time'] = current_t
+                            w_evt.writerow([self.to_dt(current_t), self.to_dt(current_t+1), floor, f"AGV_{best_agv}", park_spot[1], park_spot[0], park_spot[1], park_spot[0], 'PARKING', 'Hidden'])
+                            stats['Park'] += 1
+                            self.monitor.log_success('Park')
                     else:
-                        # Reached queue slot, wait a bit then check again
-                        current_t += 5
-                
-                # Arrived at Station Processing
-                if tele_2: stats['Visit'] += 1 # Count as visit
-                self.monitor.log_success('Visit')
-                
-                stop_time = task['stops'][0]['time'] # Assume 1 stop
-                leave_t = current_t + stop_time
-                wid = task['wave_id']
-                w_type = "IN" if "RECEIVING" in str(wid) else "OUT"
-                w_evt.writerow([self.to_dt(current_t), self.to_dt(leave_t), floor, f"WS_{target_st}", current_shelf_pos[1], current_shelf_pos[0], current_shelf_pos[1], current_shelf_pos[0], 'STATION_STATUS', f'BLUE|{w_type}|{wid}'])
-                w_evt.writerow([self.to_dt(current_t), self.to_dt(leave_t), floor, f"AGV_{best_agv}", current_shelf_pos[1], current_shelf_pos[0], current_shelf_pos[1], current_shelf_pos[0], 'PICKING', f"Processing"])
-                for t in range(current_t, int(leave_t)): res_table[t].add(current_shelf_pos)
-                current_t = int(leave_t)
-                
-                # Release Station & Exit Strategy
-                q_mgr.release_station(target_st, best_agv)
-                exit_pos = q_mgr.get_exit_spot(target_st)
-                
-                # Move to Exit Spot first (Side Exit)
-                if exit_pos:
-                    current_shelf_pos, current_t, _ = self._move_agv_segment(
-                        current_shelf_pos, exit_pos, current_t, True, f"AGV_{best_agv}",
-                        floor, astar, shuffler, traffic, w_evt, res_table, grid, reason_label="EXIT"
-                    )
-                
-                # 3. Return
-                candidates = self._find_smart_storage_spot(
-                    current_shelf_pos, self.valid_storage_spots[floor], 
-                    {s['pos'] for k,s in agv_pool.items()}, self.shelf_occupancy[floor], agv_pool, grid, limit=20
-                )
-                if not candidates: candidates = [shelf_pos]
-                drop_pos = candidates[0]
-                if grid[drop_pos[0]][drop_pos[1]] == -1: drop_pos = self._get_strict_spawn_spot(grid, set(), floor)
+                        # 真的連流浪的地方都沒有 (全地圖爆滿)，這才紀錄 Error
+                        self.monitor.log_teleport('PARK', 'NoSpot')
 
-                current_shelf_pos, current_t, tele_3 = self._move_agv_segment(
-                    current_shelf_pos, drop_pos, current_t, True, f"AGV_{best_agv}",
-                    floor, astar, shuffler, traffic, w_evt, res_table, grid,
-                    is_returning=True, agv_pool=agv_pool, reason_label="RETURN"
-                )
-                if tele_3: stats['Return'] += 1
-                self.monitor.log_success('Return')
 
-                w_evt.writerow([self.to_dt(current_t), self.to_dt(current_t+5), floor, f"AGV_{best_agv}", drop_pos[1], drop_pos[0], drop_pos[1], drop_pos[0], 'SHELF_UNLOAD', 'Done'])
-                current_t += 5
-                
-                self.shelf_occupancy[floor].add(drop_pos)
-                self.shelf_coords[shelf_id]['pos'] = drop_pos
-                self.agv_state[floor][best_agv]['pos'] = drop_pos
-                self.agv_state[floor][best_agv]['time'] = current_t
-                
-                # 4. Park
-                park_spot = parking.get_fast_parking_spot(agv_pool)
-                if park_spot:
-                    current_shelf_pos, current_t, tele_4 = self._move_agv_segment(
-                        drop_pos, park_spot, current_t, False, f"AGV_{best_agv}",
-                        floor, astar, shuffler, traffic, w_evt, res_table, grid, 
-                        is_returning=False, agv_pool=agv_pool, reason_label="PARK_FINAL"
-                    )
-                    if not tele_4:
-                        self.agv_state[floor][best_agv]['pos'] = park_spot
-                        self.agv_state[floor][best_agv]['time'] = current_t
-                        w_evt.writerow([self.to_dt(current_t), self.to_dt(current_t+1), floor, f"AGV_{best_agv}", park_spot[1], park_spot[0], park_spot[1], park_spot[0], 'PARKING', 'Hidden'])
-                        stats['Park'] += 1
-                        self.monitor.log_success('Park')
-                else:
-                    self.monitor.log_teleport('PARK', 'NoSpot')
+                    for raw_o in task['raw_orders']:
+                        wid = raw_o.get('WAVE_ID', 'UNK')
+                        ttype = 'INBOUND' if 'RECEIVING' in wid else 'OUTBOUND'
+                        total_wave_count = self.wave_totals.get(wid, 0)
+                        deadline_dt = self.to_dt(0) + timedelta(hours=4)
+                        st_label = f"WS_{task['stops'][-1]['station']}" 
+                        w_kpi.writerow([
+                            self.to_dt(current_t), ttype, wid, 'N', 
+                            self.to_dt(current_t).date(), st_label, 
+                            total_wave_count, deadline_dt
+                        ])
 
-                for raw_o in task['raw_orders']:
-                     wid = raw_o.get('WAVE_ID', 'UNK')
-                     ttype = 'INBOUND' if 'RECEIVING' in wid else 'OUTBOUND'
-                     total_wave_count = self.wave_totals.get(wid, 0)
-                     deadline_dt = self.to_dt(0) + timedelta(hours=4)
-                     st_label = f"WS_{task['stops'][-1]['station']}" 
-                     w_kpi.writerow([
-                         self.to_dt(current_t), ttype, wid, 'N', 
-                         self.to_dt(current_t).date(), st_label, 
-                         total_wave_count, deadline_dt
-                     ])
+                    done_count += 1
+                    if done_count % 50 == 0 or done_count == total_tasks: 
+                        self._cleanup_reservations(res_table, current_t)
+                        self.monitor.print_status(done_count, total_tasks, agv_pool, cleaner)
 
-                done_count += 1
-                if done_count % 50 == 0 or done_count == total_tasks: 
-                     self._cleanup_reservations(res_table, current_t)
-                     self.monitor.print_status(done_count, total_tasks, agv_pool, cleaner)
-
-        w_evt.close()
-        f_kpi.close()
-        print(f"\n✅ 模擬完成！ Total Teleports: {sum(stats.values())}")
+            w_evt.close()
+            f_kpi.close()
+            print(f"\n✅ 模擬完成！ Total Teleports: {sum(stats.values())}")
 
 if __name__ == "__main__":
     AdvancedSimulationRunner().run()
