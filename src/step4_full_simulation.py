@@ -432,35 +432,41 @@ class PhysicalQueueManager:
             }
 
     def get_target_for_agv(self, sid, agv_id):
-        q_data = self.station_queues.get(sid)
-        if not q_data: return None, False 
-        
-        if q_data['processing'] == agv_id:
-            return None, True 
+            q_data = self.station_queues.get(sid)
+            if not q_data: return None, False 
             
-        if agv_id in q_data['occupants']:
-            idx = q_data['occupants'].index(agv_id)
-            if idx == 0:
-                if q_data['processing'] is None:
-                    return (q_data['slots'][0][0], 1), True 
+            if q_data['processing'] == agv_id:
+                return None, True 
+                
+            if agv_id in q_data['occupants']:
+                idx = q_data['occupants'].index(agv_id)
+                if idx == 0:
+                    if q_data['processing'] is None:
+                        return (q_data['slots'][0][0], 1), True 
+                    else:
+                        return q_data['slots'][0], False 
                 else:
-                    return q_data['slots'][0], False 
-            else:
-                next_idx = idx - 1
-                if q_data['occupants'][next_idx] is None:
-                    return q_data['slots'][next_idx], False
-                else:
-                    return q_data['slots'][idx], False 
-                    
-        for i in range(len(q_data['slots'])-1, -1, -1):
-            if q_data['occupants'][i] is None:
-                last_slot_idx = len(q_data['slots']) - 1
-                if q_data['occupants'][last_slot_idx] is None:
-                    return q_data['slots'][last_slot_idx], False
-                else:
-                    return None, False 
-                    
-        return None, False
+                    next_idx = idx - 1
+                    if q_data['occupants'][next_idx] is None:
+                        # [優化] 移動到下一格時，也先預約下一格 (防止多車搶同格)
+                        q_data['occupants'][next_idx] = agv_id
+                        q_data['occupants'][idx] = None # 釋放舊格
+                        return q_data['slots'][next_idx], False
+                    else:
+                        return q_data['slots'][idx], False 
+                        
+            # 新車進站申請
+            for i in range(len(q_data['slots'])-1, -1, -1):
+                if q_data['occupants'][i] is None:
+                    last_slot_idx = len(q_data['slots']) - 1
+                    if q_data['occupants'][last_slot_idx] is None:
+                        # [修正] 立即佔位 (Pre-book)
+                        q_data['occupants'][last_slot_idx] = agv_id 
+                        return q_data['slots'][last_slot_idx], False
+                    else:
+                        return None, False 
+                        
+            return None, False
 
     def update_position(self, sid, agv_id, current_pos):
         q_data = self.station_queues.get(sid)
@@ -1194,9 +1200,13 @@ class AdvancedSimulationRunner:
                              break
 
                         next_q_pos, is_processing = q_mgr.get_target_for_agv(target_st, best_agv)
-                        
+                                                
                         if not next_q_pos:
-                            current_t += 5; continue
+                            # 即使是原地等待 retry，也要鎖定位置
+                            for t in range(current_t, current_t + 5):
+                                res_table[t].add(current_shelf_pos)
+                            current_t += 5
+                            continue
                             
                         current_shelf_pos, current_t, tele_2 = self._move_agv_segment(
                             current_shelf_pos, next_q_pos, current_t, True, f"AGV_{best_agv}",
@@ -1208,6 +1218,9 @@ class AdvancedSimulationRunner:
                         if is_processing:
                             break 
                         else:
+                            # [修正] 鎖定位置，防止被後車追撞
+                            for t in range(current_t, current_t + 5):
+                                res_table[t].add(current_shelf_pos)
                             current_t += 5
                     
                     # Arrived at Station Processing
