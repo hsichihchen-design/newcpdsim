@@ -5,7 +5,6 @@ import time
 import heapq
 import csv
 import random
-import re
 import math
 from collections import defaultdict, deque, Counter
 from datetime import datetime, timedelta
@@ -145,6 +144,7 @@ class TrafficController:
         self.agv_pool = agv_state_pool 
         self.reservations = reservations
 
+    # [V62 Fix] Restored clear_path_obstacles
     def clear_path_obstacles(self, start_pos, goal_pos, current_time, w_evt, floor, my_agv_name):
         blocker_id = None
         blocker_pos = None
@@ -213,8 +213,12 @@ class TrafficController:
         return None
 
     def attempt_backtrack(self, current_pos, goal_pos, current_time, w_evt, floor, agv_name):
+        """
+        [V61] Tactical Retreat Logic
+        """
         best_retreat = None
         max_dist = -1
+        
         for dr, dc in [(0, 1), (0, -1), (1, 0), (-1, 0)]:
             nr, nc = current_pos[0]+dr, current_pos[1]+dc
             if 0 <= nr < self.rows and 0 <= nc < self.cols:
@@ -237,6 +241,7 @@ class TrafficController:
             for t in range(current_time, current_time+10):
                 self.reservations[t].add(best_retreat)
             return True, best_retreat, 5
+            
         return False, current_pos, 0
 
 class CleanupManager:
@@ -290,13 +295,12 @@ class ShuffleManager:
         curr = agv_pos
         start_t = t
         
-        # [V63] Visible Shuffle: Increased duration to 10s per step
         t, curr = self._run_move(curr, blk_pos, t, False, astar, w_evt, floor, agv_name, res_table, write_move_fn, base_dt)
         if not t: return False, start_t, agv_pos
         
         self._log_event(w_evt, base_dt, t, floor, agv_name, blk_pos, 'SHUFFLE_LOAD', f"Mov Blk {sid_blk}")
         if blk_pos in self.occupancy: self.occupancy.remove(blk_pos)
-        t += 10 # More time to see it
+        t += 5
 
         t_buf, curr_buf = self._run_move(curr, buffer_pos, t, True, astar, w_evt, floor, agv_name, res_table, write_move_fn, base_dt)
         if not t_buf: 
@@ -313,7 +317,7 @@ class ShuffleManager:
         if blk_pos in self.pos_to_id: del self.pos_to_id[blk_pos]
         self.pos_to_id[buffer_pos] = sid_blk
         
-        t += 10 # More time to see it
+        t += 5
         self.cleanup_mgr.add_task(buffer_pos, blk_pos, sid_blk)
         
         return True, t, curr
@@ -326,7 +330,7 @@ class ShuffleManager:
 
     def _log_event(self, w_evt, base_dt, t, floor, agv, pos, type_, text):
         w_evt.writerow([
-            base_dt + timedelta(seconds=t), base_dt + timedelta(seconds=t+10), 
+            base_dt + timedelta(seconds=t), base_dt + timedelta(seconds=t+5), 
             floor, agv, pos[1], pos[0], pos[1], pos[0], type_, text
         ])
 
@@ -360,28 +364,16 @@ class ParkingManager:
         self.grid = grid
         self.rows, self.cols = grid.shape
         self.shelf_occupancy = shelf_occupancy
-        # [V63] Efficient Parking Set
         self.valid_spots_list = list(valid_storage_spots)
-        self.all_spots_set = set(valid_storage_spots)
     
     def get_fast_parking_spot(self, agv_pool):
-        # O(1) Approach: Filter available spots
-        # This is expensive to do every time, so we sample smarter.
-        # Logic: Randomly pick from valid_spots, check occupancy.
-        # But if fail often, we scan.
+        attempts = 0
         occupied_by_agvs = {s['pos'] for s in agv_pool.values()}
-        
-        # Fast Path: 50 attempts
-        for _ in range(50):
+        while attempts < 20:
             spot = random.choice(self.valid_spots_list)
             if spot not in self.shelf_occupancy and spot not in occupied_by_agvs:
                 return spot
-        
-        # Slow Path: Linear Scan (Fallback to avoid NoSpot)
-        for spot in self.valid_spots_list:
-            if spot not in self.shelf_occupancy and spot not in occupied_by_agvs:
-                return spot
-                
+            attempts += 1
         return None
 
 class PhysicalQueueManager:
@@ -547,7 +539,7 @@ class LiveMonitor:
 
 class AdvancedSimulationRunner:
     def __init__(self):
-        print(f"🚀 [Step 4] 啟動進階模擬 (V63: The Omni-Fix)...")
+        print(f"🚀 [Step 4] 啟動進階模擬 (V62: Fixed Traffic Controller)...")
         
         self.grid_2f = self._load_map_correct('2F_map.xlsx', 32, 61)
         self.grid_3f = self._load_map_correct('3F_map.xlsx', 32, 61)
@@ -715,7 +707,9 @@ class AdvancedSimulationRunner:
         if start_pos is None: return list(valid_spots)[:5]
         candidates = []
         agv_positions = [s['pos'] for s in agv_pool.values()]
+        
         sample_spots = random.sample(list(valid_spots), min(limit*2, len(valid_spots)))
+        
         for spot in sample_spots:
             if spot not in shelf_occupied_spots and spot not in occupied_spots:
                 dist = abs(spot[0]-start_pos[0]) + abs(spot[1]-start_pos[1])
@@ -723,19 +717,24 @@ class AdvancedSimulationRunner:
                 for apos in agv_positions:
                     d = abs(spot[0]-apos[0]) + abs(spot[1]-apos[1])
                     if d < 5: crowd_penalty += (10 - d) * 5 
+                
                 obstacle_count = 0
                 for dr, dc in [(0,1),(0,-1),(1,0),(-1,0)]:
                     nr, nc = spot[0]+dr, spot[1]+dc
                     if not (0<=nr<grid.shape[0] and 0<=nc<grid.shape[1]): obstacle_count+=1
                     elif grid[nr][nc] == -1: obstacle_count+=1
                     elif (nr, nc) in shelf_occupied_spots: obstacle_count+=1
+                
                 island_penalty = 0
                 if obstacle_count >= 3: island_penalty = 1000 
+                
                 total_score = dist + crowd_penalty + island_penalty + random.uniform(0, 10)
                 candidates.append((total_score, spot))
+        
         candidates.sort(key=lambda x: x[0])
         top_candidates = [x[1] for x in candidates[:limit]]
-        if top_candidates: return [random.choice(top_candidates)]
+        if top_candidates:
+            return [random.choice(top_candidates)]
         return []
 
     def _load_map_correct(self, filename, rows, cols):
@@ -832,6 +831,7 @@ class AdvancedSimulationRunner:
 
         while curr != target:
             if t - start_wait > TIMEOUT_LIMIT:
+                # [V61] Tactical Retreat Logic
                 success, retreat_pos, retreat_time = traffic_ctrl.attempt_backtrack(curr, target, t, w_evt, floor, agv_name)
                 if success:
                     curr = retreat_pos
@@ -924,7 +924,7 @@ class AdvancedSimulationRunner:
             
         total_tasks = len(task_queue_2f) + len(task_queue_3f)
         
-        print(f"🎬 開始模擬... (V63: The Omni-Fix)...")
+        print(f"🎬 開始模擬... (V62: Fixed Traffic Controller)...")
         print(f"   -> 原始訂單: {len(self.all_tasks_raw)} | AGV任務: {total_tasks}")
         
         for floor in ['2F', '3F']:
@@ -972,21 +972,21 @@ class AdvancedSimulationRunner:
                     path, end_t = astar.find_path(agv_pos, buf_pos, current_t, False, ignore_dynamic=True)
                     if path:
                         self.write_move_events(w_evt, path, floor, f"{best_agv}", res_table)
-                        w_evt.writerow([self.to_dt(end_t), self.to_dt(end_t+10), floor, f"AGV_{best_agv}", buf_pos[1], buf_pos[0], buf_pos[1], buf_pos[0], 'SHUFFLE_LOAD', f"Restore {sid}"])
+                        w_evt.writerow([self.to_dt(end_t), self.to_dt(end_t+5), floor, f"AGV_{best_agv}", buf_pos[1], buf_pos[0], buf_pos[1], buf_pos[0], 'SHUFFLE_LOAD', f"Restore {sid}"])
                         if buf_pos in self.shelf_occupancy: self.shelf_occupancy.remove(buf_pos)
-                        t2 = end_t + 10
+                        t2 = end_t + 5
                         
                         path2, end_t2 = astar.find_path(buf_pos, orig_pos, t2, True, ignore_dynamic=True, allow_tunneling=True)
                         if path2:
                             self.write_move_events(w_evt, path2, floor, f"{best_agv}", res_table)
-                            w_evt.writerow([self.to_dt(end_t2), self.to_dt(end_t2+10), floor, f"AGV_{best_agv}", orig_pos[1], orig_pos[0], orig_pos[1], orig_pos[0], 'SHUFFLE_UNLOAD', f"Restored {sid}"])
+                            w_evt.writerow([self.to_dt(end_t2), self.to_dt(end_t2+5), floor, f"AGV_{best_agv}", orig_pos[1], orig_pos[0], orig_pos[1], orig_pos[0], 'SHUFFLE_UNLOAD', f"Restored {sid}"])
                             self.shelf_occupancy[floor].add(orig_pos)
                             if sid != "Unknown" and sid in self.shelf_coords: self.shelf_coords[sid]['pos'] = orig_pos
                             if sid != "Unknown":
                                 if floor == '2F': self.pos_to_sid_2f[orig_pos] = sid
                                 else: self.pos_to_sid_3f[orig_pos] = sid
                             self.agv_state[floor][best_agv]['pos'] = orig_pos
-                            self.agv_state[floor][best_agv]['time'] = end_t2 + 10
+                            self.agv_state[floor][best_agv]['time'] = end_t2 + 5
                             continue 
                 
                 if not queue: break
@@ -995,7 +995,7 @@ class AdvancedSimulationRunner:
                 task = queue[0] 
                 target_st = task['stops'][-1]['station']
                 
-                # [V63] Physical Queue Check
+                # [V61] Physical Queue Check
                 target_pos, is_ready_to_work = q_mgr.get_target_for_agv(target_st, best_agv)
                 
                 if not target_pos:
