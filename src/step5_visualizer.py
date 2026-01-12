@@ -53,7 +53,7 @@ def normalize_obj_id(val):
     return val
 
 def precompute_snapshots_robust(events, initial_shelf_sets):
-    print("📸 預計算高速快照 (V51)...")
+    print("📸 預計算高速快照 (V52)...")
     base_sets = {
         '2F': {f"{x},{y}" for x,y in initial_shelf_sets['2F']},
         '3F': {f"{x},{y}" for x,y in initial_shelf_sets['3F']}
@@ -94,7 +94,7 @@ def precompute_snapshots_robust(events, initial_shelf_sets):
     return snapshots
 
 def main():
-    print("🚀 [Step 5] 啟動視覺化 (V51: Status Visibility)...")
+    print("🚀 [Step 5] 啟動視覺化 (V52: New Colors)...")
 
     map_2f = load_map_fixed('2F_map.xlsx', 32, 61)
     map_3f = load_map_fixed('3F_map.xlsx', 32, 61)
@@ -164,7 +164,7 @@ def main():
 <html>
 <head>
     <meta charset="utf-8">
-    <title>Warehouse Monitor V51 (Status Visibility)</title>
+    <title>Warehouse Monitor V52 (Rescue Color)</title>
     <style>
         body { font-family: 'Segoe UI', sans-serif; margin: 0; display: flex; flex-direction: column; height: 100vh; overflow: hidden; background: #eef1f5; }
         .header { background: #fff; height: 40px; padding: 0 20px; display: flex; align-items: center; border-bottom: 1px solid #ddd; flex-shrink: 0; }
@@ -193,7 +193,7 @@ def main():
 </head>
 <body>
     <div class="header">
-        <h3>🏭 倉儲戰情室 (V51: Status Visibility)</h3>
+        <h3>🏭 倉儲戰情室 (V52: New Colors)</h3>
         <div style="flex:1"></div>
         <span id="timeDisplay" style="font-weight: bold;">--</span>
     </div>
@@ -203,7 +203,7 @@ def main():
                 <div style="display:flex;align-items:center"><div class="box" style="background:#8d6e63"></div>料架</div>
                 <div style="display:flex;align-items:center"><div class="box" style="border-radius:50%;background:#00e5ff;border:1px solid #000"></div>AGV(空)</div>
                 <div style="display:flex;align-items:center"><div class="box" style="background:#d500f9;border:1px solid #fff"></div>AGV(載貨)</div>
-                <div style="display:flex;align-items:center"><div class="box" style="background:orange"></div>讓路/阻塞</div>
+                <div style="display:flex;align-items:center"><div class="box" style="background:#009688;border:1px solid #fff"></div>AGV(移庫)</div>
                 <div style="display:flex;align-items:center"><div class="box" style="background:red"></div>瞬移/警告</div>
             </div>
             <div class="floor-container">
@@ -242,9 +242,11 @@ def main():
                 <button onclick="togglePlay()" id="playBtn">Play</button>
                 <input type="range" id="slider" style="flex:1" oninput="isSeeking=true" onchange="isSeeking=false; onSeek(this.value)">
                 <select id="speed">
-                    <option value="5">5x Speed</option>
-                    <option value="10" selected>10x Speed</option>
-                    <option value="30">30x Speed</option>
+                    <option value="1">1x</option>
+                    <option value="2">2x</option>
+                    <option value="5">5x</option>
+                    <option value="10" selected>10x</option>
+                    <option value="30">30x</option>
                     <option value="60">1 min/s</option>
                     <option value="300">5 min/s</option>
                 </select>
@@ -278,7 +280,7 @@ def main():
     
     let agvState = {};
     agvIds.forEach(id => { 
-        agvState[id] = { floor: '2F', x: -1, y: -1, visible: false, color: '#00e5ff', loaded: false }; 
+        agvState[id] = { floor: '2F', x: -1, y: -1, visible: false, color: '#00e5ff', loaded: false, rescue: false }; 
     });
     
     let stState = {};
@@ -376,20 +378,30 @@ def main():
         const floor = e[2];
         const startT = e[0];
         const endT = e[1];
+        const id = e[3];
         
-        if (type === 'SHELF_LOAD' || type === 'SHUFFLE_LOAD') {
+        if (type === 'SHELF_LOAD') {
             const key = e[4] + "," + e[5];
             currentShelves[floor].delete(key);
-            if (e[3].startsWith('AGV')) agvState[e[3]].loaded = true;
+            if (id.startsWith('AGV')) agvState[id].loaded = true;
         } 
-        else if (type === 'SHELF_UNLOAD' || type === 'SHUFFLE_UNLOAD') {
+        else if (type === 'SHUFFLE_LOAD') {
+            const key = e[4] + "," + e[5];
+            currentShelves[floor].delete(key);
+            if (id.startsWith('AGV')) { agvState[id].loaded = true; agvState[id].rescue = true; }
+        }
+        else if (type === 'SHELF_UNLOAD') {
             const key = e[6] + "," + e[7]; 
             currentShelves[floor].add(key);
-            if (e[3].startsWith('AGV')) agvState[e[3]].loaded = false;
+            if (id.startsWith('AGV')) agvState[id].loaded = false;
+        }
+        else if (type === 'SHUFFLE_UNLOAD') {
+            const key = e[6] + "," + e[7]; 
+            currentShelves[floor].add(key);
+            if (id.startsWith('AGV')) { agvState[id].loaded = false; agvState[id].rescue = false; }
         }
 
-        if (e[3].startsWith('AGV')) {
-            const id = e[3];
+        if (id.startsWith('AGV')) {
             if (time >= startT) {
                 agvState[id].floor = floor;
                 agvState[id].visible = true;
@@ -401,10 +413,12 @@ def main():
                     agvState[id].x = e[6];
                     agvState[id].y = e[7];
                 }
+                
+                // Color Logic
                 if (type === 'YIELD') agvState[id].color = 'orange';
                 else if (type === 'PARKING') agvState[id].color = 'green';
                 else if (type.includes('TELE') || type === 'FORCE_TELE') agvState[id].color = 'red';
-                else if (type.includes('SHUFFLE')) agvState[id].color = '#aa00ff'; 
+                else if (agvState[id].rescue) agvState[id].color = '#009688'; // TEAL for Rescue
                 else agvState[id].color = agvState[id].loaded ? '#d500f9' : '#00e5ff';
             }
         }
@@ -585,7 +599,7 @@ def main():
 
     with open(OUTPUT_HTML, 'w', encoding='utf-8') as f:
         f.write(final_html)
-    print(f"✅ 視覺化生成完畢: {OUTPUT_HTML} (V51: Status Visibility)")
+    print(f"✅ 視覺化生成完畢: {OUTPUT_HTML} (V52: New Colors)")
 
 if __name__ == "__main__":
     main()
